@@ -3825,6 +3825,13 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
     4. LLM (Qwen2ForCausalLM for text generation)
     """
 
+    # ModelSlim describes the source Q/K/V and gate/up tensors separately,
+    # while vLLM materializes packed QKV and gate-up projection modules.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):

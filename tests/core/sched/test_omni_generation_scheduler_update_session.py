@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 # Imports must run in this order: vllm_omni applies patches to vllm.v1.request before
 # Request / StreamingUpdate are bound in this module. Ruff isort would reorder them.
@@ -23,7 +24,10 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
-from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.sched.omni_generation_scheduler import (
+    OmniGenerationScheduler,
+    _multimodal_output_marks_turn_end,
+)
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 
 # isort: on
@@ -158,6 +162,13 @@ def test_async_chunk_resumable_stop_rearms_connector_polling() -> None:
     assert sched.enqueued_statuses == [RequestStatus.WAITING]
     assert session.status == RequestStatus.WAITING
     assert sched.num_waiting_for_streaming_input == 0
+
+
+def test_generation_terminal_output_detection_accepts_flat_and_nested_metadata() -> None:
+    assert _multimodal_output_marks_turn_end({"meta.turn_end": torch.tensor(True)})
+    assert _multimodal_output_marks_turn_end({"meta": {"turn_end": [1]}})
+    assert not _multimodal_output_marks_turn_end({"meta.turn_end": torch.tensor(False)})
+    assert not _multimodal_output_marks_turn_end({})
 
 
 class TestReplaceSessionWithStreamingUpdate:

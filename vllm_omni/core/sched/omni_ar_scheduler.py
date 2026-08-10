@@ -43,6 +43,47 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        connector_config = getattr(self.vllm_config.model_config, "stage_connector_config", None)
+        if isinstance(connector_config, dict):
+            connector_extra = connector_config.get("extra", connector_config)
+        else:
+            connector_extra = getattr(connector_config, "extra", None)
+        connector_extra = connector_extra if isinstance(connector_extra, dict) else {}
+        try:
+            configured_local_steps = int(connector_extra.get("talker_local_decode_steps", 1) or 1)
+            local_decode_stage_id = int(connector_extra.get("talker_local_decode_stage_id", 1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "talker_local_decode_steps and talker_local_decode_stage_id must be integers"
+            ) from exc
+        current_stage_id = int(getattr(self.vllm_config.model_config, "stage_id", -1))
+        self.talker_local_decode_steps = (
+            configured_local_steps if current_stage_id == local_decode_stage_id else 1
+        )
+        if self.talker_local_decode_steps not in (1, 2, 4):
+            raise ValueError(
+                "talker_local_decode_steps must be 1, 2, or 4, "
+                f"got {self.talker_local_decode_steps}"
+            )
+        if self.talker_local_decode_steps > 1:
+            if self.scheduler_config.async_scheduling:
+                raise ValueError(
+                    "talker_local_decode_steps>1 requires async_scheduling=false "
+                    "because the scheduler must observe runner-local token accounting"
+                )
+            if self.vllm_config.speculative_config is not None:
+                raise ValueError("talker_local_decode_steps>1 is incompatible with speculative decoding")
+            # Runner-local queries write KV tokens beyond the one visible to
+            # the scheduler. Reserve every possible local slot up front.
+            self.num_lookahead_tokens = max(
+                self.num_lookahead_tokens,
+                self.talker_local_decode_steps - 1,
+            )
+            logger.info(
+                "Talker runner-local decode enabled: steps=%d lookahead=%d",
+                self.talker_local_decode_steps,
+                self.num_lookahead_tokens,
+            )
         # Track requests that need KV cache transfer when finished
         # Value is {"seq_len": int, "block_ids": list[int]}
         self.requests_needing_kv_transfer: dict[str, dict[str, Any]] = {}
@@ -293,6 +334,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         inter_stage_outputs = getattr(model_runner_output, "inter_stage_outputs", None)
+        local_computed_tokens = getattr(model_runner_output, "local_computed_tokens", None) or {}
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
@@ -350,6 +392,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # request is aborted while the model is executing it (e.g.,
                 # in pipeline parallelism or async scheduling).
                 continue
+
+            extra_computed = int(local_computed_tokens.get(req_id, 0) or 0)
+            local_decode_steps = getattr(self, "talker_local_decode_steps", 1)
+            if not isinstance(local_decode_steps, int):
+                local_decode_steps = 1
+            if extra_computed < 0 or extra_computed > local_decode_steps - 1:
+                raise RuntimeError(
+                    "Invalid runner-local computed-token count for "
+                    f"{req_id}: {extra_computed} (steps={local_decode_steps})"
+                )
+            if extra_computed:
+                if request.num_output_placeholders:
+                    raise RuntimeError(
+                        "Runner-local decode cannot reconcile async output placeholders "
+                        f"for request {req_id}"
+                    )
+                request.num_computed_tokens += extra_computed
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []

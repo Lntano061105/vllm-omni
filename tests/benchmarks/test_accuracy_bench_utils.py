@@ -64,7 +64,8 @@ def test_build_serve_common_argv_accepts_realtime_seed_tts_route(tmp_path):
     argv = build_serve_common_argv(
         host="127.0.0.1",
         port=8000,
-        model="openbmb/MiniCPM-o-4_5",
+        model="/workspace/MiniCPM-o-4_5",
+        served_model_name="openbmb/MiniCPM-o-4_5",
         num_prompts=4,
         max_concurrency=1,
         num_warmups=0,
@@ -77,6 +78,8 @@ def test_build_serve_common_argv_accepts_realtime_seed_tts_route(tmp_path):
 
     assert argv[argv.index("--backend") + 1] == "openai-realtime-tts"
     assert argv[argv.index("--endpoint") + 1] == "/v1/realtime"
+    assert argv[argv.index("--model") + 1] == "/workspace/MiniCPM-o-4_5"
+    assert argv[argv.index("--served-model-name") + 1] == "openbmb/MiniCPM-o-4_5"
 
 
 def test_sync_dataset_env_preserves_seed_tts_hf_repo_id(monkeypatch):

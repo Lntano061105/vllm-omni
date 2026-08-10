@@ -24,10 +24,36 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from .batched_token2wav import (
     BatchedToken2Wav,
     BatchedToken2WavState,
+    PromptFeatures,
     state_shape_signature,
 )
 
 logger = init_logger(__name__)
+
+
+def _remove_weight_norm_for_inference(module: nn.Module) -> int:
+    """Bake legacy or parametrization-based weight norm into module weights."""
+    from torch.nn.utils import parametrize, remove_weight_norm
+
+    removed = 0
+    for child in module.modules():
+        if parametrize.is_parametrized(child, tensor_name="weight"):
+            parametrize.remove_parametrizations(
+                child,
+                "weight",
+                leave_parametrized=True,
+            )
+            removed += 1
+            continue
+        # Older torch/HiFT releases install a forward pre-hook instead of a
+        # parametrization.  The legacy remover is intentionally probed only
+        # when the modern form is absent.
+        try:
+            remove_weight_norm(child)
+        except ValueError:
+            continue
+        removed += 1
+    return removed
 
 
 def _batch_error(reason: str, **details: Any) -> RuntimeError:
@@ -85,6 +111,20 @@ class _RuntimePrompt:
 
 
 @dataclass(frozen=True)
+class _CompletedOutput:
+    cache_epoch: int
+    chunk_seq: int
+    audio: torch.Tensor
+    duplex_epoch: int
+    duplex_turn_id: int
+    segment_text_utf8: torch.Tensor
+    tts_is_last_chunk: bool
+    segment_end: bool
+    speak_tail: bool
+    turn_end: bool
+
+
+@dataclass(frozen=True)
 class _WorkItem:
     output_index: int
     state_id: str
@@ -102,8 +142,10 @@ class _WorkItem:
     segment_text_utf8: torch.Tensor
     tts_is_last_chunk: bool
     segment_end: bool
+    speak_tail: bool
     turn_end: bool
     has_payload: bool = True
+    cached_audio: torch.Tensor | None = None
 
 
 class MiniCPMO45Code2Wav(nn.Module):
@@ -129,6 +171,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         self.model_path = str(vllm_config.model_config.model)
         self.backend: BatchedToken2Wav | None = None
         self._states: dict[str, _RequestState] = {}
+        # Async connector delivery can replay a terminal payload after the
+        # original terminal chunk has already been decoded and its live state
+        # released. Keep a bounded completion watermark so those replays are
+        # idempotent instead of looking like a missing mid-stream state.
+        self._completed_outputs: dict[str, _CompletedOutput] = {}
+        self._completed_output_limit = 256
+        self._debug_stream_state = os.getenv("VLLM_OMNI_DEBUG_CODE2WAV_STATE", "0") == "1"
         self._runtime_prompts: dict[str, _RuntimePrompt] = {}
         self._request_prompt_keys: dict[str, str] = {}
         self._runtime_prompt_dir = tempfile.TemporaryDirectory(
@@ -138,6 +187,8 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
+        self._cache_initial_state = bool(extra.get("code2wav_cache_initial_state", False))
+        self._cross_prompt_batching = bool(extra.get("code2wav_cross_prompt_batching", False))
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_explicit = "prompt_wav" in extra
         self._default_prompt_wav = str(
@@ -291,6 +342,14 @@ class MiniCPMO45Code2Wav(nn.Module):
                 entry.owners.add(item.state_id)
                 self._request_prompt_keys[item.state_id] = cache_key
 
+    def _use_cached_initial_state(self, item: _WorkItem) -> bool:
+        """Cache the persistent default voice, not one-shot runtime references."""
+        return (
+            self._cache_initial_state
+            and item.prompt_cache_id == self._default_prompt_id
+            and item.prompt_wav == self._default_prompt_wav
+        )
+
     def _prune_unowned_runtime_prompts(self) -> None:
         for cache_key, entry in list(self._runtime_prompts.items()):
             if entry.owners:
@@ -354,6 +413,7 @@ class MiniCPMO45Code2Wav(nn.Module):
                 segment_text_utf8=torch.empty(0, dtype=torch.uint8),
                 tts_is_last_chunk=False,
                 segment_end=False,
+                speak_tail=False,
                 turn_end=False,
                 has_payload=False,
             )
@@ -370,6 +430,38 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         last_chunk = bool(_scalar(meta.get("last_chunk"), False))
         tts_is_last_chunk = bool(_scalar(meta.get("tts_is_last_chunk"), False))
+        completed = self._completed_outputs.get(state_id)
+        if completed is not None and (
+            cache_epoch < completed.cache_epoch
+            or (cache_epoch == completed.cache_epoch and chunk_seq <= completed.chunk_seq)
+        ):
+            # The generation runner can execute a terminal connector payload
+            # once more before retiring the request. Its per-step output slot
+            # may then expose only the replay, so preserve the original final
+            # audio and turn boundary instead of replacing them with an empty
+            # row. Realtime completion is idempotent by response id.
+            return _WorkItem(
+                output_index=index,
+                state_id=state_id,
+                request_id=request_id,
+                cache_epoch=cache_epoch,
+                chunk_seq=chunk_seq,
+                prompt_cache_id=self._default_prompt_id,
+                prompt_wav=self._default_prompt_wav,
+                last_chunk=True,
+                tokens=segment.new_empty(0, dtype=torch.long),
+                previous=None,
+                runtime_prompt_key=None,
+                duplex_epoch=completed.duplex_epoch,
+                duplex_turn_id=completed.duplex_turn_id,
+                segment_text_utf8=completed.segment_text_utf8,
+                tts_is_last_chunk=completed.tts_is_last_chunk,
+                segment_end=completed.segment_end,
+                speak_tail=completed.speak_tail,
+                turn_end=completed.turn_end,
+                has_payload=False,
+                cached_audio=completed.audio,
+            )
         codes = info.get("codes")
         audio = codes.get("audio") if isinstance(codes, Mapping) else None
         tokens = _codec_tensor(audio, segment)
@@ -385,6 +477,8 @@ class MiniCPMO45Code2Wav(nn.Module):
                 raise _batch_error(
                     "missing_state_for_chunk",
                     request_id=request_id,
+                    state_id=state_id,
+                    known_state_ids=sorted(self._states),
                     cache_epoch=cache_epoch,
                     chunk_seq=chunk_seq,
                 )
@@ -451,19 +545,32 @@ class MiniCPMO45Code2Wav(nn.Module):
             segment_text_utf8=segment_text_utf8,
             tts_is_last_chunk=tts_is_last_chunk,
             segment_end=bool(_scalar(meta.get("segment_end"), False)),
+            speak_tail=bool(_scalar(meta.get("speak_tail"), False)),
             turn_end=bool(_scalar(meta.get("turn_end"), False)),
         )
 
-    @staticmethod
-    def _bucket_key(item: _WorkItem) -> tuple[Any, ...]:
+    def _bucket_key(self, item: _WorkItem) -> tuple[Any, ...]:
         cache_signature: Any
         if item.previous is None:
             cache_signature = ("uninitialized",)
+            prompt_signature: tuple[str, str] | tuple[str] = (
+                item.prompt_cache_id,
+                item.prompt_wav,
+            )
         else:
             cache_signature = state_shape_signature(item.previous.token2wav)
+            # Once prompt initialization is complete, the request-owned flow
+            # and HiFT states already contain all prompt-dependent caches.
+            # Requests with equal cache shapes can therefore share one live
+            # decode batch even when their reference audio differs; speaker
+            # embeddings are stacked per row by BatchedToken2Wav.
+            prompt_signature = (
+                ("initialized",)
+                if self._cross_prompt_batching
+                else (item.prompt_cache_id, item.prompt_wav)
+            )
         return (
-            item.prompt_cache_id,
-            item.prompt_wav,
+            prompt_signature,
             int(item.tokens.numel()),
             cache_signature,
             item.last_chunk,
@@ -515,16 +622,31 @@ class MiniCPMO45Code2Wav(nn.Module):
             with torch.inference_mode(False), torch.no_grad():
                 self._build_backend()
 
-        state_ids = kwargs.get("request_ids")
-        if state_ids is None:
-            state_ids = []
-            for index, info in enumerate(runtime_additional_information):
-                if not isinstance(info, Mapping):
-                    state_ids.append(str(index))
-                    continue
-                meta = info.get("meta")
-                source = meta if isinstance(meta, Mapping) else info
-                state_ids.append(str(_scalar(source.get("request_id"), index)))
+        # A native-duplex stream submits multiple short Stage-2 engine
+        # requests. Their runner request IDs may change between codec chunks,
+        # while payload ``meta.request_id`` is the stable end-to-end stream
+        # identity. Token2Wav caches must therefore be keyed by the payload ID.
+        # Fall back to runner IDs only for payload-less profiling/prewarm work.
+        runner_request_ids = kwargs.get("request_ids")
+        state_ids = []
+        for index, info in enumerate(runtime_additional_information):
+            fallback = (
+                runner_request_ids[index]
+                if runner_request_ids is not None and index < len(runner_request_ids)
+                else index
+            )
+            if not isinstance(info, Mapping):
+                state_ids.append(str(fallback))
+                continue
+            meta = info.get("meta")
+            # NPU's connector may put the stable producer request id at the
+            # payload top level while also carrying a ``meta`` mapping that
+            # does not repeat it.  Do not let the mere presence of that
+            # mapping hide the top-level id and fall back to the per-chunk
+            # runner request id.
+            meta_request_id = meta.get("request_id") if isinstance(meta, Mapping) else None
+            payload_request_id = _scalar(meta_request_id, _scalar(info.get("request_id"), fallback))
+            state_ids.append(str(payload_request_id))
         if len(state_ids) != len(segments):
             raise _batch_error(
                 "request_id_count_mismatch",
@@ -543,6 +665,23 @@ class MiniCPMO45Code2Wav(nn.Module):
                         value_type=type(info).__name__,
                     )
                 items.append(self._parse_item(index, str(state_id), segment, info))
+                if self._debug_stream_state:
+                    item = items[-1]
+                    logger.warning(
+                        "Code2Wav state trace parse runner_id=%s state_id=%s request_id=%s "
+                        "epoch=%s chunk=%s last=%s tts_last=%s tokens=%s known=%s",
+                        runner_request_ids[index]
+                        if runner_request_ids is not None and index < len(runner_request_ids)
+                        else None,
+                        item.state_id,
+                        item.request_id,
+                        item.cache_epoch,
+                        item.chunk_seq,
+                        item.last_chunk,
+                        item.tts_is_last_chunk,
+                        item.tokens.numel(),
+                        sorted(self._states),
+                    )
         except Exception:
             self._prune_unowned_runtime_prompts()
             raise
@@ -551,6 +690,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             self._prune_unowned_runtime_prompts()
             raise _batch_error("duplicate_request_in_forward", request_ids=state_ids)
         outputs = [empty for _ in segments]
+        for item in items:
+            if item.cached_audio is not None:
+                outputs[item.output_index] = item.cached_audio
         sentinels = [item for item in items if item.last_chunk and item.tokens.numel() == 0]
         segment_markers = [
             item for item in items if not item.last_chunk and item.tts_is_last_chunk and item.tokens.numel() == 0
@@ -608,11 +750,18 @@ class MiniCPMO45Code2Wav(nn.Module):
                 ).append(item)
         for bucket in initial_marker_buckets.values():
             try:
-                features = self.backend.prepare_prompt(
-                    bucket[0].prompt_cache_id,
-                    bucket[0].prompt_wav,
-                )
-                states = self.backend.setup_batch(features, len(bucket))
+                if self._use_cached_initial_state(bucket[0]):
+                    _, states = self.backend.setup_cached_batch(
+                        bucket[0].prompt_cache_id,
+                        bucket[0].prompt_wav,
+                        len(bucket),
+                    )
+                else:
+                    features = self.backend.prepare_prompt(
+                        bucket[0].prompt_cache_id,
+                        bucket[0].prompt_wav,
+                    )
+                    states = self.backend.setup_batch(features, len(bucket))
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()
                 if isinstance(exc, RuntimeError) and str(exc).startswith("MiniCPMO45Code2WavBatchError "):
@@ -641,13 +790,24 @@ class MiniCPMO45Code2Wav(nn.Module):
         for bucket in buckets.values():
             batch_size = len(bucket)
             try:
-                features = self.backend.prepare_prompt(
-                    bucket[0].prompt_cache_id,
-                    bucket[0].prompt_wav,
-                )
                 if bucket[0].previous is None:
-                    states = self.backend.setup_batch(features, batch_size)
+                    if self._use_cached_initial_state(bucket[0]):
+                        features, states = self.backend.setup_cached_batch(
+                            bucket[0].prompt_cache_id,
+                            bucket[0].prompt_wav,
+                            batch_size,
+                        )
+                    else:
+                        features = self.backend.prepare_prompt(
+                            bucket[0].prompt_cache_id,
+                            bucket[0].prompt_wav,
+                        )
+                        states = self.backend.setup_batch(features, batch_size)
                 else:
+                    feature_rows = [
+                        self.backend.prepare_prompt(item.prompt_cache_id, item.prompt_wav) for item in bucket
+                    ]
+                    features = feature_rows[0] if batch_size == 1 else feature_rows
                     states = [item.previous.token2wav for item in bucket if item.previous is not None]
                 tokens = torch.stack([item.tokens for item in bucket], dim=0)
                 audios, next_states = self.backend.decode_batch(
@@ -692,8 +852,27 @@ class MiniCPMO45Code2Wav(nn.Module):
         for request_id, state in pending.items():
             if state is None:
                 self._states.pop(request_id, None)
+                self._release_request_prompt(request_id)
             else:
                 self._states[request_id] = state
+        for item in items:
+            if item.has_payload and item.last_chunk:
+                self._completed_outputs[item.state_id] = _CompletedOutput(
+                    cache_epoch=item.cache_epoch,
+                    chunk_seq=item.chunk_seq,
+                    audio=outputs[item.output_index].detach(),
+                    duplex_epoch=item.duplex_epoch,
+                    duplex_turn_id=item.duplex_turn_id,
+                    segment_text_utf8=item.segment_text_utf8,
+                    tts_is_last_chunk=item.tts_is_last_chunk,
+                    segment_end=item.segment_end,
+                    speak_tail=item.speak_tail,
+                    turn_end=item.turn_end,
+                )
+        while len(self._completed_outputs) > self._completed_output_limit:
+            self._completed_outputs.pop(next(iter(self._completed_outputs)))
+        if self._debug_stream_state:
+            logger.warning("Code2Wav state trace commit live=%s", sorted(self._states))
         sample_rate_tensor = torch.as_tensor(sample_rate, dtype=torch.int32)
         return OmniOutput(
             text_hidden_states=None,
@@ -708,15 +887,27 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "meta.llm_output_text_utf8": [item.segment_text_utf8 for item in items],
                 "meta.tts_is_last_chunk": [torch.tensor(item.tts_is_last_chunk, dtype=torch.bool) for item in items],
                 "meta.segment_end": [torch.tensor(item.segment_end, dtype=torch.bool) for item in items],
+                "meta.speak_tail": [torch.tensor(item.speak_tail, dtype=torch.bool) for item in items],
                 "meta.turn_end": [torch.tensor(item.turn_end, dtype=torch.bool) for item in items],
             },
         )
 
     def on_requests_finished(self, finished_req_ids: set[str] | list[str]) -> None:
+        """Keep live Token2Wav state across async engine-step completions.
+
+        The generation runner invokes this hook before the next ``forward``.
+        In an async-chunk stream, a finished engine request means that one
+        Code2Wav chunk completed, not that the persistent audio stream ended.
+        Removing state here loses chunk 0 immediately before chunk 1.
+
+        ``forward`` owns the stream lifetime: explicit ``last_chunk`` metadata
+        removes the state.  Once no live state remains, this callback may
+        release any request-owned prompt resources.
+        """
         for request_id in finished_req_ids:
             state_id = str(request_id)
-            self._states.pop(state_id, None)
-            self._release_request_prompt(state_id)
+            if state_id not in self._states:
+                self._release_request_prompt(state_id)
 
     def make_omni_output(self, model_outputs: Any, **_: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
@@ -775,4 +966,144 @@ class MiniCPMO45Code2Wav(nn.Module):
             )
         finally:
             torch.set_default_dtype(previous_dtype)
-        self.backend = BatchedToken2Wav(token2wav)
+        if current_omni_platform.is_npu() and bool(
+            extra.get("token2wav_npu_fused_encoder_attention", False)
+        ):
+            from vllm_omni.platforms.npu.models.step_audio2_token2wav import (
+                patch_minicpmo45_encoder_fused_attention,
+            )
+
+            patched_attention_layers = patch_minicpmo45_encoder_fused_attention(
+                token2wav.flow.encoder
+            )
+            logger.info(
+                "Patched %d MiniCPM-o encoder attention layers with Ascend fused attention",
+                patched_attention_layers,
+            )
+        remove_hift_weight_norm = bool(
+            extra.get("token2wav_remove_hift_weight_norm", False)
+        )
+        if remove_hift_weight_norm:
+            # HiFT is loaded in eval mode and never updated by Stage 2.  Its
+            # legacy weight_norm hooks otherwise rebuild normalized weights
+            # before every convolution on every streamed chunk, creating a
+            # large eager-mode NPU launch storm.  Bake those weights once at
+            # startup.  Do not call HiFT.remove_weight_norm(): current HiFT
+            # creates modern parametrizations but its helper still invokes
+            # torch's legacy hook remover.
+            removed = _remove_weight_norm_for_inference(token2wav.hift)
+            if removed == 0:
+                raise RuntimeError(
+                    "MiniCPM-o Token2Wav HiFT contained no weight-norm "
+                    "parametrizations to remove"
+                )
+            logger.info(
+                "Baked %d HiFT weight-norm parametrizations for inference",
+                removed,
+            )
+        cfg_mode = str(extra.get("token2wav_cfg_mode", "full"))
+        solver = str(extra.get("token2wav_solver", "euler"))
+        self.backend = BatchedToken2Wav(
+            token2wav,
+            cfg_mode=cfg_mode,
+            solver=solver,
+            prompt_bucket_frames=int(extra.get("code2wav_prompt_bucket_frames", 0)),
+            prompt_encoder_device=extra.get("code2wav_prompt_encoder_device"),
+        )
+        logger.info(
+            "MiniCPM-o Code2Wav backend ready: solver=%s solver_steps=%d "
+            "estimator_evaluations=%d cached_dit_modulation=%s float16=%s "
+            "cfg_mode=%s hift_weight_norm_removed=%s cache_initial_state=%s",
+            solver,
+            self.backend.n_timesteps,
+            self.backend.num_evaluations,
+            self.backend.cached_dit_modulation,
+            use_float16,
+            cfg_mode,
+            remove_hift_weight_norm,
+            self._cache_initial_state,
+        )
+        if bool(extra.get("code2wav_prewarm", False)):
+            self._prewarm_backend(extra, current_omni_platform)
+
+    def _prewarm_backend(self, extra: Mapping[str, Any], platform: Any) -> None:
+        """Compile the prompt, first-chunk, and steady Code2Wav paths at startup."""
+        if self.backend is None:
+            return
+        steady_frames = int(extra.get("codec_chunk_frames", 25))
+        left_context_frames = int(extra.get("codec_left_context_frames", 3))
+        initial_frames = int(extra.get("initial_codec_chunk_frames", 0) or 0)
+        if steady_frames <= 0 or left_context_frames < 0 or initial_frames < 0:
+            raise ValueError(
+                "Invalid MiniCPM-o Code2Wav prewarm config: "
+                f"codec_chunk_frames={steady_frames}, "
+                f"codec_left_context_frames={left_context_frames}, "
+                f"initial_codec_chunk_frames={initial_frames}"
+            )
+        initial_frames = min(initial_frames, steady_frames)
+        live_chunk_sizes = []
+        if 0 < initial_frames < steady_frames:
+            live_chunk_sizes.append(initial_frames)
+        live_chunk_sizes.append(steady_frames)
+        raw_prompt_buckets = extra.get("code2wav_prewarm_prompt_buckets", [])
+        if isinstance(raw_prompt_buckets, int):
+            raw_prompt_buckets = [raw_prompt_buckets]
+        if not isinstance(raw_prompt_buckets, (list, tuple)):
+            raise ValueError("code2wav_prewarm_prompt_buckets must be an integer list")
+        try:
+            prompt_buckets = sorted({int(size) for size in raw_prompt_buckets})
+        except (TypeError, ValueError) as exc:
+            raise ValueError("code2wav_prewarm_prompt_buckets must contain integers") from exc
+        if prompt_buckets and prompt_buckets[0] <= 0:
+            raise ValueError("code2wav_prewarm_prompt_buckets must contain positive integers")
+
+        features = self.backend.prepare_prompt(
+            self._default_prompt_id,
+            self._default_prompt_wav,
+        )
+        actual_frames = int(features.speech_tokens.shape[1])
+        mel_up_rate = int(features.mels.shape[1]) // actual_frames
+        for bucket_frames in prompt_buckets:
+            if bucket_frames < actual_frames:
+                # This state is discarded: truncation is used only to execute
+                # the smaller operator shape during startup. Live prompts are
+                # never truncated.
+                bucket_features = PromptFeatures(
+                    speech_tokens=features.speech_tokens[:, :bucket_frames],
+                    projected_speaker_embedding=features.projected_speaker_embedding,
+                    mels=features.mels[:, : bucket_frames * mel_up_rate],
+                )
+            else:
+                bucket_features = self.backend.bucket_prompt_features(
+                    features,
+                    bucket_frames,
+                )
+            self.backend.setup_batch(bucket_features, 1)
+
+        features, states = self.backend.setup_cached_batch(
+            self._default_prompt_id,
+            self._default_prompt_wav,
+            1,
+        )
+        device = features.speech_tokens.device
+        for new_frames in live_chunk_sizes:
+            tokens = torch.full(
+                (1, left_context_frames + new_frames),
+                4218,
+                dtype=torch.long,
+                device=device,
+            )
+            _, states = self.backend.decode_batch(
+                tokens,
+                features,
+                states,
+                last_chunk=False,
+            )
+        platform.synchronize()
+        logger.info(
+            "MiniCPM-o Code2Wav prewarm completed for prompt buckets %s, "
+            "live codec chunks %s with %d left-context frames",
+            prompt_buckets,
+            live_chunk_sizes,
+            left_context_frames,
+        )

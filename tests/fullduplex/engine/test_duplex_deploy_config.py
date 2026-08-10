@@ -32,6 +32,7 @@ def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> No
     assert deploy.duplex_session.max_pending_turns_per_session == 4
     assert deploy.duplex_session.max_sessions == 1
     assert deploy.duplex_session.completed_append_cache_size == 256
+    assert deploy.duplex_session.native_silence_continuation_delay_ms is None
     with pytest.raises(FrozenInstanceError):
         deploy.duplex_session.idle_ttl_s = 1.0  # type: ignore[misc]
 
@@ -43,6 +44,35 @@ def test_duplex_session_runtime_accepts_disabled_idle_expiry(tmp_path) -> None:
     deploy = load_deploy_config(deploy_path)
 
     assert deploy.duplex_session.idle_ttl_s is None
+
+
+def test_duplex_session_runtime_accepts_zero_native_silence_delay(tmp_path) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n  native_silence_continuation_delay_ms: 0\nstages: []\n",
+        encoding="utf-8",
+    )
+
+    deploy = load_deploy_config(deploy_path)
+
+    assert deploy.duplex_session.native_silence_continuation_delay_ms == 0
+
+
+def test_duplex_session_runtime_rejects_negative_native_silence_delay(tmp_path) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n  native_silence_continuation_delay_ms: -1\nstages: []\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"duplex_session\.native_silence_continuation_delay_ms "
+            r"must be >= 0 or null"
+        ),
+    ):
+        load_deploy_config(deploy_path)
 
 
 @pytest.mark.parametrize(

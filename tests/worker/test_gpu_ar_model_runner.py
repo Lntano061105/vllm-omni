@@ -140,6 +140,25 @@ def test_sparse_mm_req_ids_requires_sparse_audio_marker():
     assert GPUARModelRunner._sparse_mm_req_ids({"meta.req_id": ["r1"], "meta.sparse_audio": ["1"]}) == ["r1"]
 
 
+@pytest.mark.parametrize("engine_output_type", ["audio", "latent"])
+def test_sparse_mm_routing_applies_to_audio_and_latent_talker_stages(engine_output_type):
+    downstream, sparse_index, enabled = GPUARModelRunner._resolve_sparse_mm_routing(
+        engine_output_type=engine_output_type,
+        req_ids_output_copy=["r1", "r2", "r3"],
+        downstream_req_ids=["r1", "r2", "r3"],
+        multimodal_outputs={
+            "meta": {
+                "req_id": ["r2"],
+                "sparse_audio": ["1"],
+            },
+        },
+    )
+
+    assert downstream == ["r2"]
+    assert sparse_index == {"r2": 0}
+    assert enabled is True
+
+
 def test_runner_assisted_full_attention_metadata_request_is_opt_in():
     runner = object.__new__(GPUARModelRunner)
     runner.model = object()

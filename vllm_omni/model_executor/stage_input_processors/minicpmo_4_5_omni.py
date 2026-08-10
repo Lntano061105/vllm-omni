@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -33,6 +34,12 @@ class _MiniCPMO45MetaStruct(MetaStruct):
     duplex_turn_id: int | None = None
     duplex_epoch: int | None = None
     segment_end: bool | None = None
+    # True for every codec payload produced from the final Thinker
+    # ``<turn_eos>`` handoff.  At this point the LLM side has stopped and the
+    # remaining Talker/Code2Wav work belongs to the downstream-only SPEAK
+    # tail.  Keep this separate from ``turn_end``: the latter is a protocol
+    # terminal marker and must only be set on the final payload.
+    speak_tail: bool | None = None
     turn_end: bool | None = None
     tts_is_last_chunk: bool | None = None
 
@@ -125,20 +132,30 @@ def _coerce_int(value):
         return None
 
 
-def _codec_config(transfer_manager: Any) -> tuple[int, int]:
+def _codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
     chunk_frames = int(config.get("codec_chunk_frames", 25))
     left_context_frames = int(config.get("codec_left_context_frames", 3))
-    if chunk_frames <= 0 or left_context_frames < 0:
+    initial_chunk_frames = int(config.get("initial_codec_chunk_frames", 0) or 0)
+    if chunk_frames <= 0 or left_context_frames < 0 or initial_chunk_frames < 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
             f"codec_chunk_frames={chunk_frames}, "
-            f"codec_left_context_frames={left_context_frames}"
+            f"codec_left_context_frames={left_context_frames}, "
+            f"initial_codec_chunk_frames={initial_chunk_frames}"
         )
-    return chunk_frames, left_context_frames
+    if initial_chunk_frames > chunk_frames:
+        logger.warning(
+            "initial_codec_chunk_frames=%d > codec_chunk_frames=%d; "
+            "clamping the MiniCPM-o first chunk to the steady chunk size.",
+            initial_chunk_frames,
+            chunk_frames,
+        )
+        initial_chunk_frames = chunk_frames
+    return chunk_frames, left_context_frames, initial_chunk_frames
 
 
 def _codec_scalars(value: Any) -> list[int]:
@@ -288,17 +305,44 @@ def tts2code2wav_async_chunk(
         pending_text_utf8.extend(current_text_utf8)
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
-    finished = bool(is_finished or (callable(request_finished) and request_finished()))
-    chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    # The Talker model emits its request-local terminal decision in the same
+    # sparse multimodal packet as the final codec delta.  The connector can
+    # observe that packet before the scheduler has transitioned ``request`` to
+    # a finished status, so relying only on the callback/request flags drops
+    # the control-only TTS segment boundary.  Native duplex then never
+    # schedules the next silence unit and the Thinker cannot continue toward
+    # ``<|turn_eos|>``.
+    model_finished = bool(_coerce_int(output_meta.get("finished")))
+    finished = bool(
+        is_finished
+        or model_finished
+        or (callable(request_finished) and request_finished())
+    )
+    if native_duplex and os.getenv("MINICPMO45_DUPLEX_DEBUG") == "1" and finished:
+        logger.info(
+            "MiniCPM-o duplex Talker boundary: request_id=%s internal_id=%s "
+            "callback_finished=%s model_finished=%s request_finished=%s "
+            "codec_delta=%d turn_end=%s",
+            request_id,
+            internal_id,
+            bool(is_finished),
+            model_finished,
+            bool(callable(request_finished) and request_finished()),
+            len(pending),
+            turn_end,
+        )
+    chunk_frames, left_context_frames, initial_chunk_frames = _codec_config(transfer_manager)
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    if not flush_pending and len(pending) < chunk_frames:
+    first_chunk = int(state["codec_end"]) == 0
+    emit_frames = initial_chunk_frames if first_chunk and initial_chunk_frames > 0 else chunk_frames
+    if not flush_pending and len(pending) < emit_frames:
         return None
 
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else emit_frames)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
@@ -372,6 +416,7 @@ def tts2code2wav_async_chunk(
             duplex_turn_id=duplex_turn_id,
             llm_output_text_utf8=segment_text_utf8,
             tts_is_last_chunk=flush_pending,
+            speak_tail=native_duplex and turn_end,
             turn_end=turn_end and last_chunk,
             ref_audio_sr=ref_audio_sr,
         ),
@@ -395,7 +440,7 @@ def tts2code2wav_full_payload(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     codes = _extract_codec_delta(pooling_output, request_id)
-    _, left_context_frames = _codec_config(transfer_manager)
+    _, left_context_frames, _ = _codec_config(transfer_manager)
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
     output_codes = [*context, *codes]
 
@@ -440,6 +485,7 @@ def tts2code2wav_full_payload(
             duplex_turn_id=_coerce_int(duplex_info.get("model_turn_id", duplex_info.get("turn_id"))),
             duplex_epoch=_coerce_int(duplex_info.get("epoch")),
             segment_end=bool(meta_info.get("segment_end", False)),
+            speak_tail=False,
             turn_end=bool(meta_info.get("turn_end", False)),
             tts_is_last_chunk=True,
         ),

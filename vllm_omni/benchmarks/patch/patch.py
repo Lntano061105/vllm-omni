@@ -12,7 +12,7 @@ import traceback
 import uuid
 import wave
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -618,6 +618,18 @@ class MixRequestFuncOutput(RequestFuncOutput):
     audio_duration: float = 0.0
     audio_frames: int = 0
     audio_rtf: float = 0.0
+    #: Steady-state per-packet RTF values. Each item is the wall-clock
+    #: interval since the preceding audio packet divided by this packet's
+    #: decoded audio duration. The first packet is deliberately excluded:
+    #: its request-start wait is reported separately as ``audio_ttfp``.
+    audio_chunk_rtfs: list[float] = field(default_factory=list)
+    #: Per-chunk RTF while the full SPEAK generation chain is active. This is
+    #: the challenge ranking metric; unlike ``audio_chunk_rtfs`` it excludes
+    #: packets explicitly marked as downstream-only SPEAK tail.
+    audio_speak_generation_rtfs: list[float] = field(default_factory=list)
+    #: Per-chunk RTF after the LLM-side SPEAK segment has ended and only
+    #: downstream TTS / Token2Wav work remains.
+    audio_speak_tail_rtfs: list[float] = field(default_factory=list)
     image_count: int = 0
     image_generation_time_ms: float = 0.0
     image_pixels: int = 0
@@ -973,6 +985,7 @@ async def async_request_openai_chat_omni_completions(
         most_recent_timestamp = st
         timestamp = st
         audio_generate_time = 0.0
+        previous_audio_packet_timestamp: float | None = None
         output.itl = []
         output.generated_text = ""
         output.ttft = 0.0
@@ -980,6 +993,9 @@ async def async_request_openai_chat_omni_completions(
         output.audio_duration = 0.0
         output.audio_frames = 0
         output.audio_rtf = 0.0
+        output.audio_chunk_rtfs = []
+        output.audio_speak_generation_rtfs = []
+        output.audio_speak_tail_rtfs = []
         output.text_latency = 0.0
         output.output_tokens = 0
         output.error = ""
@@ -1079,9 +1095,24 @@ async def async_request_openai_chat_omni_completions(
                                                             if first_inconsistent_wav_params is None:
                                                                 first_inconsistent_wav_params = params
                                                             continue
-                                                        wav_pcm_buffer.extend(
-                                                            wav_reader.readframes(wav_reader.getnframes())
+                                                        chunk_frames = wav_reader.getnframes()
+                                                        wav_pcm_buffer.extend(wav_reader.readframes(chunk_frames))
+                                                        chunk_duration_s = (
+                                                            chunk_frames / float(params[2])
+                                                            if chunk_frames > 0 and params[2] > 0
+                                                            else 0.0
                                                         )
+                                                        if (
+                                                            previous_audio_packet_timestamp is not None
+                                                            and chunk_duration_s > 0
+                                                        ):
+                                                            output.audio_chunk_rtfs.append(
+                                                                defs.compute_audio_rtf(
+                                                                    timestamp - previous_audio_packet_timestamp,
+                                                                    chunk_duration_s,
+                                                                )
+                                                            )
+                                                        previous_audio_packet_timestamp = timestamp
                                                 except Exception as ex:
                                                     logger.warning("Failed to parse wav audio chunk: %s", ex)
                                             else:
@@ -1533,6 +1564,8 @@ async def async_request_openai_realtime_duplex(
             turn_timings: list[dict[str, object]] = []
             turn_pcm_bytes: list[bytes] = []
             turn_transcripts: list[str] = []
+            speak_generation_rtfs: list[float] = []
+            speak_tail_rtfs: list[float] = []
             measurement_origin = {
                 "ttft": "conversation.item.create client send to first non-empty text delta",
                 "ttfp": "conversation.item.create client send to first audio packet",
@@ -1593,6 +1626,18 @@ async def async_request_openai_realtime_duplex(
                         **request_metrics,
                     }
                 )
+                audio_output = timing.get("audio_output")
+                if isinstance(audio_output, dict):
+                    speak_generation_rtfs.extend(
+                        float(value)
+                        for value in audio_output.get("speak_generation_chunk_rtfs", [])
+                        if isinstance(value, int | float)
+                    )
+                    speak_tail_rtfs.extend(
+                        float(value)
+                        for value in audio_output.get("speak_tail_chunk_rtfs", [])
+                        if isinstance(value, int | float)
+                    )
                 response_audio = client.events.audio_bytes(response_id)
                 turn_pcm_bytes.append(
                     _pcm_s16le_to_seed_tts_wer_bytes(
@@ -1626,6 +1671,8 @@ async def async_request_openai_realtime_duplex(
             output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
             output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
             output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+            output.audio_speak_generation_rtfs = speak_generation_rtfs
+            output.audio_speak_tail_rtfs = speak_tail_rtfs
             output.audio_duration = (
                 sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
             )
@@ -1993,6 +2040,7 @@ async def benchmark(
             defs.TOTAL_AUDIO_DURATION_S: getattr(metrics, defs.TOTAL_AUDIO_DURATION_S),
             defs.TOTAL_AUDIO_FRAMES: getattr(metrics, defs.TOTAL_AUDIO_FRAMES),
             defs.AUDIO_THROUGHPUT: getattr(metrics, defs.AUDIO_THROUGHPUT),
+            defs.AUDIO_CONTINUITY_OK_RATE: getattr(metrics, defs.AUDIO_CONTINUITY_OK_RATE),
             defs.TOTAL_IMAGES: getattr(metrics, defs.TOTAL_IMAGES),
             defs.IMAGE_THROUGHPUT: getattr(metrics, defs.IMAGE_THROUGHPUT),
             defs.AVERAGE_PIXELS_PER_IMAGE: getattr(metrics, defs.AVERAGE_PIXELS_PER_IMAGE),
@@ -2102,7 +2150,12 @@ async def benchmark(
         is_text_token_metric = not (metric_attribute_name == "e2el" or metric_attribute_name.startswith("audio"))
         if is_text_token_metric and getattr(metrics, "total_output", 0) == 0:
             return
-        is_audio_rtf = metric_attribute_name == defs.AUDIO_RTF
+        is_audio_rtf = metric_attribute_name in (
+            defs.AUDIO_RTF,
+            defs.AUDIO_CHUNK_RTF,
+            defs.AUDIO_SPEAK_GENERATION_RTF,
+            defs.AUDIO_SPEAK_TAIL_RTF,
+        )
         is_audio_duration_or_underrun = metric_attribute_name in (defs.AUDIO_DURATION, defs.AUDIO_UNDERRUN)
 
         suffix = "_ms"

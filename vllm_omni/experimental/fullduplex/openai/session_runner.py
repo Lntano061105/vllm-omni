@@ -522,10 +522,16 @@ class DuplexSessionRunnerMixin:
             append_tail = actor.native_append_tail
             if (append_tail is None or append_tail.done()) and real_native_input_waiting():
                 return False
-            continuation_delay_s = max(
-                0.0,
-                float(session.capabilities.chunk_period_ms or 1000) / 1000.0,
+            configured_delay_ms = session.runtime_config.get(
+                "native_silence_continuation_delay_ms"
             )
+            if configured_delay_ms is None:
+                configured_delay_ms = (
+                    self._duplex_session_config.native_silence_continuation_delay_ms
+                )
+            if configured_delay_ms is None:
+                configured_delay_ms = session.capabilities.chunk_period_ms or 1000
+            continuation_delay_s = max(0.0, float(configured_delay_ms) / 1000.0)
             if continuation_delay_s > 0:
                 await asyncio.sleep(continuation_delay_s)
                 if (

@@ -931,6 +931,7 @@ async def test_native_session_update_rebuilds_server_runtime_policy():
     assert runtime_config["duplex_stage_sampling_params"]["0"]["temperature"] == 0.2
     assert runtime_config["duplex_stage_sampling_params"]["0"]["top_k"] == 20
     assert runtime_config["duplex_stage_sampling_params"]["0"]["top_p"] == 0.8
+    assert runtime_config["duplex_stage_sampling_params"]["1"]["min_tokens"] == 0
 
 
 @pytest.mark.asyncio
@@ -2131,11 +2132,13 @@ def test_duplex_listen_latent_does_not_poison_cumulative_audio_offset():
         multimodal_output={
             "audio": torch.zeros(32768, dtype=torch.float32),
             "sr": 24000,
+            "meta.speak_tail": torch.tensor(True),
         },
     )
     speak_results = list(data_plane.project_output(speak_output))
     assert [result.get("audio_data") for result in speak_results] == ["wav-32768"]
     assert speak_results[0]["text"] == " It was a very"
+    assert speak_results[0]["speak_tail"] is True
 
 
 def test_direct_listen_decision_survives_inner_completion_metadata():
@@ -5534,6 +5537,7 @@ async def test_minicpmo_native_duplex_separates_public_and_runtime_config(monkey
     assert opened_runtime_config["duplex_stage_max_tokens"] == {"0": 20, "1": 8192}
     assert opened_runtime_config["duplex_stage_sampling_params"]["0"]["top_k"] == 20
     assert opened_runtime_config["duplex_stage_sampling_params"]["0"]["top_p"] == 0.8
+    assert opened_runtime_config["duplex_stage_sampling_params"]["1"]["min_tokens"] == 0
     assert base64.b64decode(opened_runtime_config["ref_audio_data"]) == struct.pack("<1600f", *([0.25] * 1600))
 
 
@@ -5622,6 +5626,30 @@ async def test_minicpmo_native_duplex_text_only_omits_ref_audio_when_client_does
     assert "ref_audio_data" not in runtime_config
     assert "ref_audio_format" not in runtime_config
     assert "ref_audio_sample_rate_hz" not in runtime_config
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_native_duplex_reads_server_owned_silence_continuation_delay(monkeypatch):
+    monkeypatch.setattr(
+        MiniCPMO45NativeDuplexServingAdapter,
+        "_load_native_tokenizer",
+        staticmethod(lambda model_config: None),
+    )
+    event = _native_session_create("sid-native-fast-silence", modalities=["text"])
+    config = DuplexSessionConfig.from_event(event)
+    model_config = SimpleNamespace(
+        model="openbmb/MiniCPM-o-4_5",
+        stage_connector_config={
+            "extra": {"native_silence_continuation_delay_ms": 0}
+        },
+    )
+
+    runtime_config = await MiniCPMO45NativeDuplexServingAdapter.prepare_runtime_config(
+        config,
+        model_config=model_config,
+    )
+
+    assert runtime_config["native_silence_continuation_delay_ms"] == 0
 
 
 @pytest.mark.asyncio

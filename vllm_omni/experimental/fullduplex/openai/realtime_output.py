@@ -710,7 +710,15 @@ class RealtimeOutputProjector:
             else event.get("sample_rate_hz") or format_rate or self._output_sample_rate_hz
         )
         metadata: dict[str, object] = {}
-        for key in ("session_id", "epoch", "model_speak", "end_of_turn", "playback", "vllm_omni"):
+        for key in (
+            "session_id",
+            "epoch",
+            "model_speak",
+            "speak_tail",
+            "end_of_turn",
+            "playback",
+            "vllm_omni",
+        ):
             if key in event:
                 metadata[key] = event[key]
         duration_ms = event.get("audio_duration_ms")

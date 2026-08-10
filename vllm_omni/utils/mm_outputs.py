@@ -182,6 +182,8 @@ def to_payload_element(
         }
     elif isinstance(element, list):
         # For lists, clone tensors to avoid cross-request aliasing
+        if not element:
+            return []
         if pass_lists_through:
             return [elem.clone() if isinstance(elem, torch.Tensor) else elem for elem in element]
         element = element[idx] if idx < len(element) else element[0]

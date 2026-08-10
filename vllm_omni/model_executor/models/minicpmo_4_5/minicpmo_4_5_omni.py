@@ -133,6 +133,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         self._language_model_names = ["model"]
         self.prefer_model_sampler = self.model_stage in {"llm", "tts"}
+        self.supports_talker_local_decode = self.model_stage == "tts" and bool(
+            getattr(self.talker, "supports_talker_local_decode", False)
+        )
         # Both AR stages require model-specific embeddings.  The Thinker uses
         # preprocess for duplex audio, while the Talker converts the
         # tts_token_ids/tts_hidden_states handoff into its conditioning

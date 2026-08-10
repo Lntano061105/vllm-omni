@@ -434,6 +434,11 @@ class DuplexSessionRuntimeConfig:
     max_pending_turns_per_session: int = 4
     max_sessions: int = 1
     completed_append_cache_size: int = 256
+    # Optional wall-clock pacing between model-native silence continuation
+    # units.  ``None`` preserves realtime pacing at the model chunk period;
+    # zero lets latency-focused deployments immediately schedule the next
+    # equivalent silence unit without changing its audio payload duration.
+    native_silence_continuation_delay_ms: int | None = None
 
     def __post_init__(self) -> None:
         positive = {
@@ -448,6 +453,13 @@ class DuplexSessionRuntimeConfig:
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
             raise ValueError("duplex_session.idle_ttl_s must be positive or null")
+        if (
+            self.native_silence_continuation_delay_ms is not None
+            and self.native_silence_continuation_delay_ms < 0
+        ):
+            raise ValueError(
+                "duplex_session.native_silence_continuation_delay_ms must be >= 0 or null"
+            )
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")

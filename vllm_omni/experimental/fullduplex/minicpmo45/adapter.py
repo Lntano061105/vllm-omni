@@ -38,6 +38,7 @@ class MiniCPMO45NativeDuplexServingAdapter:
             "ref_audio_format",
             "ref_audio_sample_rate_hz",
             "initial_user_text",
+            "native_silence_continuation_delay_ms",
         }
     )
 
@@ -81,6 +82,15 @@ class MiniCPMO45NativeDuplexServingAdapter:
         stage0 = deepcopy(stage0) if isinstance(stage0, dict) else {}
         stage0["temperature"] = config.temperature if config.temperature is not None else 0.7
         stage_sampling["0"] = stage0
+        stage1 = stage_sampling.get("1")
+        stage1 = deepcopy(stage1) if isinstance(stage1, dict) else {}
+        # The Talker owns its request-local codec minimum/terminal policy.
+        # Keeping the non-duplex stage default (min_tokens=50) masks the stop
+        # token emitted by each 26-token native-duplex unit, doubling decode
+        # work and preventing the TTS segment boundary from being retired on
+        # time.
+        stage1["min_tokens"] = 0
+        stage_sampling["1"] = stage1
         runtime_config["duplex_stage_sampling_params"] = stage_sampling
         return runtime_config
 
@@ -91,6 +101,20 @@ class MiniCPMO45NativeDuplexServingAdapter:
             raise ValueError("ref_audio_path is not accepted by native duplex; use ref_audio URI instead")
         cls.validate_client_config(config)
         runtime_config: dict[str, object] = {"instructions": config.instructions}
+        connector_extra = cls._connector_extra_config(model_config)
+        continuation_delay = connector_extra.get("native_silence_continuation_delay_ms")
+        if continuation_delay is not None:
+            try:
+                continuation_delay_ms = int(continuation_delay)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "native_silence_continuation_delay_ms must be an integer"
+                ) from exc
+            if continuation_delay_ms < 0:
+                raise ValueError(
+                    "native_silence_continuation_delay_ms must be >= 0"
+                )
+            runtime_config["native_silence_continuation_delay_ms"] = continuation_delay_ms
         initial_user_text = extra_body.pop("duplex_initial_user_text", None)
         if isinstance(initial_user_text, str) and initial_user_text:
             runtime_config["initial_user_text"] = initial_user_text
@@ -142,6 +166,15 @@ class MiniCPMO45NativeDuplexServingAdapter:
         config.ref_audio = None
         return runtime_config
 
+    @staticmethod
+    def _connector_extra_config(model_config: Any) -> dict[str, object]:
+        connector = getattr(model_config, "stage_connector_config", None)
+        if isinstance(connector, dict):
+            extra = connector.get("extra", connector)
+        else:
+            extra = getattr(connector, "extra", None)
+        return dict(extra) if isinstance(extra, dict) else {}
+
     @classmethod
     def _apply_default_scheduler_policy(
         cls,
@@ -161,7 +194,10 @@ class MiniCPMO45NativeDuplexServingAdapter:
         stop_token_ids = cls._native_stage0_stop_token_ids(model_config)
         if stop_token_ids:
             stage0_params["stop_token_ids"] = stop_token_ids
-        runtime_config["duplex_stage_sampling_params"] = {"0": stage0_params}
+        runtime_config["duplex_stage_sampling_params"] = {
+            "0": stage0_params,
+            "1": {"min_tokens": 0},
+        }
         scheduler_token_id = cls._native_scheduler_token_id(model_config)
         if scheduler_token_id is not None:
             runtime_config["duplex_scheduler_token_id"] = scheduler_token_id

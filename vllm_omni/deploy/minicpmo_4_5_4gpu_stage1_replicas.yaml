@@ -1,17 +1,26 @@
-# Experimental validation profile: one thinker and three Stage1 replicas.
-# This is not a recommended production entrypoint.
+# Experimental four-NPU validation profile.
 #
-# Stage 0: GPU 0
-# Stage 1: replicas on GPU 1, 2, and 3
+# Physical device layout:
+#   - Stage 0 (Thinker): NPU 4
+#   - Stage 1 (Talker): three replicas on NPU 5, 6, and 7
+#   - Stage 2 (Code2Wav): NPU 4, shared with Stage 0
+#
+# Stage 0 and Stage 2 deliberately use the exact same device string. This
+# keeps them in the same sequential initialization group and prevents both
+# stages from contending for the physical NPU 4 initialization lock.
 base_config: minicpmo_4_5.yaml
 pipeline: minicpmo_4_5
 session_mode: duplex
 
 stages:
   - stage_id: 0
+    devices: "4"
     async_scheduling: false
 
   - stage_id: 1
-    devices: "1,2,3"
+    devices: "5,6,7"
     num_replicas: 3
     async_scheduling: false
+
+  - stage_id: 2
+    devices: "4"

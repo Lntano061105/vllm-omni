@@ -7,9 +7,11 @@ import torch.nn as nn
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    PromptFeatures,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    _remove_weight_norm_for_inference,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -50,8 +52,11 @@ class _FakeEstimator(nn.Module):
         self.blocks = [_FakeBlock()]
         self.cfg_batches: list[int] = []
         self.speaker_order: list[list[float]] = []
+        self.times: list[float] = []
+        self.t_embedder_calls = 0
 
     def t_embedder(self, time):
+        self.t_embedder_calls += 1
         return time[:, None]
 
     def blocks_forward_chunk(
@@ -64,9 +69,10 @@ class _FakeEstimator(nn.Module):
         cnn_out,
         att_out,
     ):
-        del time, mask, cnn_cache, att_cache
+        del mask, cnn_cache, att_cache
         self.cfg_batches.append(inputs.shape[0])
         self.speaker_order.append(inputs[:, 2, 0].tolist())
+        self.times.append(float(time[0, 0, 0]))
         marker = inputs[:, 1, 0]
         cnn_out.copy_(marker.reshape(1, -1, 1, 1).expand_as(cnn_out))
         att_out.copy_(marker.reshape(1, -1, 1, 1, 1).expand_as(att_out))
@@ -84,18 +90,20 @@ class _FakeDecoder(nn.Module):
 class _FakeFlow(nn.Module):
     def __init__(self):
         super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(()))
         self.encoder = _FakeEncoder()
         self.encoder_proj = nn.Identity()
         self.decoder = _FakeDecoder()
         self.spk_embed_affine_layer = nn.Identity()
 
     def input_embedding(self, tokens):
-        return tokens.to(torch.float32).unsqueeze(-1)
+        return tokens.to(self.dummy.dtype).unsqueeze(-1)
 
 
 class _FakeHiFT(nn.Module):
     def __init__(self):
         super().__init__()
+        self.dummy = nn.Parameter(torch.zeros(()))
         self.calls: list[int] = []
 
     def forward(self, mel, source):
@@ -131,17 +139,35 @@ class _FakeToken2Wav:
     def stream(self, *args, **kwargs):
         raise AssertionError("sequential stream fallback must never be called")
 
+
+def test_remove_weight_norm_for_inference_supports_modern_parametrizations():
+    layer = nn.Conv1d(2, 3, kernel_size=3, padding=1).eval()
+    layer = torch.nn.utils.parametrizations.weight_norm(layer)
+    inputs = torch.randn(1, 2, 5)
+    expected = layer(inputs)
+
+    assert _remove_weight_norm_for_inference(layer) == 1
+    assert not torch.nn.utils.parametrize.is_parametrized(layer, "weight")
+    torch.testing.assert_close(layer(inputs), expected)
+
     def __call__(self, *args, **kwargs):
         raise AssertionError("sequential __call__ fallback must never be called")
 
 
-def _config(minimum: int = 1):
+def _config(
+    minimum: int = 1,
+    *,
+    cache_initial_state: bool = False,
+    cross_prompt_batching: bool = False,
+):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
             stage_connector_config={
                 "extra": {
                     "code2wav_min_batch_size": minimum,
+                    "code2wav_cache_initial_state": cache_initial_state,
+                    "code2wav_cross_prompt_batching": cross_prompt_batching,
                     "prompt_cache_id": "shared",
                     "prompt_wav": "/fake/prompt.wav",
                 }
@@ -150,10 +176,15 @@ def _config(minimum: int = 1):
     )
 
 
-def _model():
+def _model(*, cache_initial_state: bool = False, cross_prompt_batching: bool = False):
     token2wav = _FakeToken2Wav()
     backend = BatchedToken2Wav(token2wav)
-    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    model = MiniCPMO45Code2Wav(
+        vllm_config=_config(
+            cache_initial_state=cache_initial_state,
+            cross_prompt_batching=cross_prompt_batching,
+        )
+    )
     model.backend = backend
     return model, token2wav
 
@@ -231,6 +262,7 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     )
 
     assert token2wav.prompt_calls == 1
+    assert token2wav.flow.decoder.estimator.t_embedder_calls == 1
     assert token2wav.flow.encoder.calls == [2, 2]
     assert token2wav.flow.decoder.estimator.cfg_batches == [4, 4, 4, 4]
     assert all(order == [1.0, 1.0, 0.0, 0.0] for order in token2wav.flow.decoder.estimator.speaker_order)
@@ -241,6 +273,192 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache0.data_ptr() != cache1.data_ptr()
     assert cache0[0, 0, 0, 0, 0].item() == 10
     assert cache1[0, 0, 0, 0, 0].item() == 20
+
+
+def test_adapter_batches_distinct_prompt_speakers_after_initialization():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+    first = adapter.prepare_prompt("first", "/fake/first.wav")
+    second = PromptFeatures(
+        speech_tokens=first.speech_tokens,
+        projected_speaker_embedding=torch.full_like(first.projected_speaker_embedding, 2.0),
+        mels=first.mels,
+    )
+    states = [adapter.setup_batch(first, 1)[0], adapter.setup_batch(second, 1)[0]]
+    token2wav.flow.decoder.estimator.speaker_order.clear()
+
+    adapter.decode_batch(
+        torch.tensor([[10, 11], [20, 21]]),
+        [first, second],
+        states,
+        last_chunk=False,
+    )
+
+    assert token2wav.flow.decoder.estimator.speaker_order == [
+        [1.0, 2.0, 0.0, 0.0],
+        [1.0, 2.0, 0.0, 0.0],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("cfg_mode", "expected_scale"),
+    [("conditional", 1.0), ("conditional_scale", 1.7)],
+)
+def test_adapter_conditional_only_cfg_modes_halve_estimator_batch(cfg_mode, expected_scale):
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, cfg_mode=cfg_mode)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+    audios, _ = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=False,
+    )
+
+    assert token2wav.flow.decoder.estimator.cfg_batches == [1, 1, 1, 1]
+    torch.testing.assert_close(audios[0][0], torch.tensor(expected_scale * 10))
+
+
+def test_adapter_rk4_uses_four_evaluations_per_solver_step():
+    token2wav = _FakeToken2Wav()
+    token2wav.n_timesteps = 1
+    adapter = BatchedToken2Wav(token2wav, cfg_mode="conditional", solver="rk4")
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+    estimator = token2wav.flow.decoder.estimator
+    estimator.cfg_batches.clear()
+    estimator.times.clear()
+
+    audios, states = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=False,
+    )
+
+    assert adapter.num_evaluations == 4
+    assert estimator.cfg_batches == [1, 1, 1, 1]
+    assert estimator.times == pytest.approx([0.0, 0.5, 0.5, 1.0])
+    assert states[0].flow_cache["estimator_cnn_cache"].shape[0] == 4
+    torch.testing.assert_close(audios[0][0], torch.tensor(10.0))
+
+
+def test_adapter_keeps_half_flow_and_float_hift_dtype_boundaries_explicit():
+    token2wav = _FakeToken2Wav()
+    token2wav.flow.half()
+    adapter = BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    states = adapter.setup_batch(prompt, 1)
+
+    assert prompt.projected_speaker_embedding.dtype == torch.float16
+    assert prompt.mels.dtype == torch.float16
+    assert states[0].hift_cache["mel"].dtype == torch.float32
+
+    audios, states = adapter.decode_batch(
+        torch.tensor([[10, 11]]),
+        prompt,
+        states,
+        last_chunk=False,
+    )
+
+    assert audios[0].dtype == torch.float32
+    assert states[0].hift_cache["mel"].dtype == torch.float32
+
+
+def test_cached_initial_state_reuses_read_only_template_then_isolates_live_caches():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+
+    first_features, first_states = adapter.setup_cached_batch("shared", "/fake/prompt.wav", 2)
+    second_features, second_states = adapter.setup_cached_batch("shared", "/fake/prompt.wav", 1)
+
+    assert first_features is second_features
+    assert token2wav.prompt_calls == 1
+    assert token2wav.flow.encoder.calls == [1]
+    assert len(first_states) == 2
+    assert len(second_states) == 1
+    first_cache = first_states[0].flow_cache["estimator_cnn_cache"]
+    sibling_cache = first_states[1].flow_cache["estimator_cnn_cache"]
+    second_cache = second_states[0].flow_cache["estimator_cnn_cache"]
+    assert first_cache.data_ptr() == sibling_cache.data_ptr() == second_cache.data_ptr()
+    template_snapshot = first_cache.clone()
+
+    _, live_states = adapter.decode_batch(
+        torch.tensor([[10, 11], [20, 21]]),
+        first_features,
+        first_states,
+        last_chunk=False,
+    )
+
+    torch.testing.assert_close(first_cache, template_snapshot)
+    live_cache0 = live_states[0].flow_cache["estimator_cnn_cache"]
+    live_cache1 = live_states[1].flow_cache["estimator_cnn_cache"]
+    assert live_cache0.data_ptr() != live_cache1.data_ptr()
+    assert live_cache0.data_ptr() != first_cache.data_ptr()
+    assert live_cache1.data_ptr() != first_cache.data_ptr()
+
+
+def test_evict_prompt_removes_cached_initial_state() -> None:
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+
+    adapter.setup_cached_batch("shared", "/fake/prompt.wav", 1)
+    adapter.evict_prompt("shared", "/fake/prompt.wav")
+    adapter.setup_cached_batch("shared", "/fake/prompt.wav", 1)
+
+    assert token2wav.prompt_calls == 2
+    assert token2wav.flow.encoder.calls == [1, 1]
+
+
+def test_prompt_features_are_padded_to_reusable_shape_bucket() -> None:
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav, prompt_bucket_frames=4)
+
+    features = adapter.prepare_prompt("voice", "/fake/prompt.wav")
+
+    assert features.speech_tokens.tolist() == [[5, 6, 4218, 4218]]
+    assert features.mels.shape == (1, 8, 1)
+    assert features.mels[:, 4:].eq(1).all()
+
+
+def test_code2wav_prewarm_runs_initial_and_steady_shapes_then_synchronizes() -> None:
+    model, token2wav = _model()
+
+    class _FakePlatform:
+        synchronized = False
+
+        @classmethod
+        def synchronize(cls):
+            cls.synchronized = True
+
+    model._prewarm_backend(
+        {
+            "initial_codec_chunk_frames": 4,
+            "codec_chunk_frames": 25,
+            "codec_left_context_frames": 3,
+            "code2wav_prewarm_prompt_buckets": [2],
+        },
+        _FakePlatform,
+    )
+
+    assert token2wav.prompt_calls == 1
+    # One prompt shape, one cached default state, then initial + steady live
+    # codec chunks. All are single-request warmups.
+    assert token2wav.flow.encoder.calls == [1, 1, 1, 1]
+    assert token2wav.hift.calls == [1, 1]
+    assert _FakePlatform.synchronized is True
+
+
+def test_model_reuses_cached_initial_state_for_default_voice() -> None:
+    model, token2wav = _model(cache_initial_state=True)
+
+    _forward(model, [_info("a", 0, [10, 11], last_chunk=True)])
+    _forward(model, [_info("b", 0, [12, 13], last_chunk=True)])
+
+    assert token2wav.prompt_calls == 1
+    # One prompt setup plus one live decode per request.
+    assert token2wav.flow.encoder.calls == [1, 1, 1]
 
 
 def test_fade_in_out_limits_overlap_to_available_previous_audio():
@@ -282,6 +500,20 @@ def test_estimator_cache_stack_split_round_trip_preserves_cfg_rows():
         )
 
 
+def test_single_request_cache_stack_split_reuses_existing_storage():
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+    prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    state = adapter.setup_batch(prompt, 1)[0]
+
+    stacked = adapter._stack_flow_cache([state])
+    restored = adapter._split_flow_cache(stacked, 1)[0]
+
+    for name, original in state.flow_cache.items():
+        assert stacked[name].data_ptr() == original.data_ptr()
+        assert restored[name].data_ptr() == original.data_ptr()
+
+
 def test_model_preserves_output_slots_and_prefers_runtime_codes():
     model, token2wav = _model()
     output = _forward(
@@ -312,6 +544,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
             "duplex_turn_id": 7,
             "llm_output_text_utf8": segment_text_utf8,
             "tts_is_last_chunk": True,
+            "speak_tail": False,
             "turn_end": False,
         }
     )
@@ -319,6 +552,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     segment_output = _forward(model, [segment])
 
     assert segment_output.multimodal_outputs["meta.turn_end"][0].item() is False
+    assert segment_output.multimodal_outputs["meta.speak_tail"][0].item() is False
     # A Talker unit boundary only drains pending codec tokens. The official
     # streaming path keeps Token2wav open until the assistant turn ends.
     assert token2wav.flow.encoder.last_chunk_calls[-1] is False
@@ -329,6 +563,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     final["meta"]["chunk_seq"] = 1
     final["meta"]["last_chunk"] = True
     final["meta"]["turn_end"] = True
+    final["meta"]["speak_tail"] = True
     output = _forward(model, [final])
 
     payload = output.multimodal_outputs
@@ -340,6 +575,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
         segment_text_utf8,
     )
     assert payload["meta.tts_is_last_chunk"][0].item() is True
+    assert payload["meta.speak_tail"][0].item() is True
     assert payload["meta.turn_end"][0].item() is True
     assert token2wav.flow.encoder.last_chunk_calls[-1] is True
     assert "duplex" not in model._states
@@ -384,7 +620,7 @@ def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_pa
     first["meta"].pop("prompt_cache_id")
     _forward(model, [first], request_ids=["internal-a"])
 
-    prompt_key = model._request_prompt_keys["internal-a"]
+    prompt_key = model._request_prompt_keys["voice-a"]
     prompt_path = Path(model._runtime_prompts[prompt_key].path)
     prompt_path.unlink()
 
@@ -395,12 +631,22 @@ def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_pa
     _forward(model, [second], request_ids=["internal-b"])
 
     assert prompt_path.is_file()
-    assert model._runtime_prompts[prompt_key].owners == {"internal-a", "internal-b"}
+    assert model._runtime_prompts[prompt_key].owners == {"voice-a", "voice-b"}
 
+    _forward(
+        model,
+        [_info("voice-a", 1, [14, 15], last_chunk=True)],
+        request_ids=["internal-a"],
+    )
     model.on_requests_finished(["internal-a"])
     assert prompt_path.is_file()
-    assert model._runtime_prompts[prompt_key].owners == {"internal-b"}
+    assert model._runtime_prompts[prompt_key].owners == {"voice-b"}
 
+    _forward(
+        model,
+        [_info("voice-b", 1, [16, 17], last_chunk=True)],
+        request_ids=["internal-b"],
+    )
     model.on_requests_finished(["internal-b"])
     assert not prompt_path.exists()
     assert prompt_key not in model._runtime_prompts
@@ -445,8 +691,8 @@ def test_runtime_prompt_files_are_isolated_between_model_instances(tmp_path, mon
     _forward(first_model, [runtime_ref_info("voice-a")], request_ids=["internal-a"])
     _forward(second_model, [runtime_ref_info("voice-b")], request_ids=["internal-b"])
 
-    first_key = first_model._request_prompt_keys["internal-a"]
-    second_key = second_model._request_prompt_keys["internal-b"]
+    first_key = first_model._request_prompt_keys["voice-a"]
+    second_key = second_model._request_prompt_keys["voice-b"]
     first_path = Path(first_model._runtime_prompts[first_key].path)
     second_path = Path(second_model._runtime_prompts[second_key].path)
     assert first_key == second_key
@@ -454,10 +700,20 @@ def test_runtime_prompt_files_are_isolated_between_model_instances(tmp_path, mon
     assert first_path.is_file()
     assert second_path.is_file()
 
+    _forward(
+        first_model,
+        [_info("voice-a", 1, [12, 13], last_chunk=True)],
+        request_ids=["internal-a"],
+    )
     first_model.on_requests_finished(["internal-a"])
     assert not first_path.exists()
     assert second_path.is_file()
 
+    _forward(
+        second_model,
+        [_info("voice-b", 1, [12, 13], last_chunk=True)],
+        request_ids=["internal-b"],
+    )
     second_model.on_requests_finished(["internal-b"])
     assert not second_path.exists()
 
@@ -625,6 +881,36 @@ def test_singleton_and_mixed_shape_buckets_use_same_batched_backend_without_fall
     assert token2wav.hift.calls[-2:] == [1, 1]
 
 
+def test_initialized_requests_with_distinct_prompts_share_live_decode_batch():
+    model, token2wav = _model(cross_prompt_batching=True)
+    first_a = _info("a", 0, [1, 2])
+    first_b = _info("b", 0, [3, 4])
+    first_a["meta"].update(prompt_cache_id="voice-a", prompt_wav="/fake/voice-a.wav")
+    first_b["meta"].update(prompt_cache_id="voice-b", prompt_wav="/fake/voice-b.wav")
+
+    _forward(model, [first_a, first_b])
+    assert token2wav.hift.calls[-2:] == [1, 1]
+    token2wav.hift.calls.clear()
+
+    _forward(model, [_info("a", 1, [5, 6]), _info("b", 1, [7, 8])])
+
+    assert token2wav.hift.calls == [2]
+
+
+def test_cross_prompt_batching_is_opt_in():
+    model, token2wav = _model()
+    first_a = _info("a", 0, [1, 2])
+    first_b = _info("b", 0, [3, 4])
+    first_a["meta"].update(prompt_cache_id="voice-a", prompt_wav="/fake/voice-a.wav")
+    first_b["meta"].update(prompt_cache_id="voice-b", prompt_wav="/fake/voice-b.wav")
+    _forward(model, [first_a, first_b])
+    token2wav.hift.calls.clear()
+
+    _forward(model, [_info("a", 1, [5, 6]), _info("b", 1, [7, 8])])
+
+    assert token2wav.hift.calls == [1, 1]
+
+
 def test_backend_failure_does_not_commit_any_request_state(monkeypatch):
     model, _ = _model()
     _forward(
@@ -657,21 +943,24 @@ def test_backend_failure_does_not_commit_any_request_state(monkeypatch):
     assert model._states == before
 
 
-def test_cleanup_and_profile_output_are_aligned():
+def test_engine_step_completion_keeps_live_stream_state_for_next_chunk():
     model, _ = _model()
     _forward(model, [_info("a", 0, [1, 2]), _info("b", 0, [3, 4])])
     model.on_requests_finished(["a"])
-    assert set(model._states) == {"b"}
+    assert set(model._states) == {"a", "b"}
+
+    _forward(model, [_info("a", 1, [5, 6])])
+    assert model._states["a"].chunk_seq == 1
 
     profile = model(
         input_ids=torch.zeros(5, dtype=torch.long),
         seq_token_counts=[2, 3],
     )
     assert [audio.numel() for audio in profile.multimodal_outputs["model_outputs"]] == [0, 0]
-    assert set(model._states) == {"b"}
+    assert set(model._states) == {"a", "b"}
 
 
-def test_cleanup_uses_generation_runner_internal_request_ids():
+def test_stream_state_uses_stable_payload_request_ids_across_runner_ids():
     model, _ = _model()
     _forward(
         model,
@@ -681,7 +970,59 @@ def test_cleanup_uses_generation_runner_internal_request_ids():
 
     model.on_requests_finished(["internal-a"])
 
-    assert set(model._states) == {"internal-b"}
+    assert set(model._states) == {"external-a", "external-b"}
+
+    _forward(
+        model,
+        [_info("external-a", 1, [5, 6], last_chunk=True)],
+        request_ids=["internal-a"],
+    )
+    model.on_requests_finished(["internal-a"])
+
+    assert set(model._states) == {"external-b"}
+
+
+def test_stream_state_uses_top_level_payload_id_when_meta_omits_id():
+    model, _ = _model()
+    first = _info("external-a", 0, [1, 2])
+    first["meta"].pop("request_id")
+    first["request_id"] = "external-a"
+    _forward(model, [first], request_ids=["internal-chunk-0"])
+
+    assert set(model._states) == {"external-a"}
+
+    second = _info("external-a", 1, [5, 6], last_chunk=True)
+    second["meta"].pop("request_id")
+    second["request_id"] = "external-a"
+    _forward(model, [second], request_ids=["internal-chunk-1"])
+
+    assert model._states == {}
+
+
+def test_replayed_terminal_chunk_is_idempotently_ignored():
+    model, _ = _model()
+    _forward(model, [_info("stream-a", 0, [1, 2])])
+    terminal = _info("stream-a", 1, [3, 4], last_chunk=True)
+    terminal["meta"].update(
+        tts_is_last_chunk=True,
+        speak_tail=True,
+        turn_end=True,
+    )
+    first = _forward(model, [terminal])
+
+    assert first.multimodal_outputs["model_outputs"][0].numel() > 0
+    assert model._states == {}
+
+    replay = _forward(model, [terminal])
+
+    torch.testing.assert_close(
+        replay.multimodal_outputs["model_outputs"][0],
+        first.multimodal_outputs["model_outputs"][0],
+    )
+    assert replay.multimodal_outputs["meta.turn_end"][0].item() is True
+    assert replay.multimodal_outputs["meta.speak_tail"][0].item() is True
+    assert replay.multimodal_outputs["meta.tts_is_last_chunk"][0].item() is True
+    assert model._states == {}
 
 
 def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
@@ -716,8 +1057,8 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     output = _forward(model, [final])
 
     assert output.multimodal_outputs["meta.tts_is_last_chunk"][0].item() is True
-    assert model._request_prompt_keys["voice-a"] == prompt_key
-    model.on_requests_finished(["voice-a"])
+    # Explicit last_chunk owns the persistent stream and runtime prompt
+    # lifetime; no runner-ID cleanup callback is required.
     assert "voice-a" not in model._request_prompt_keys
     assert prompt_key not in model._runtime_prompts
     assert not Path(prompt_wav).exists()

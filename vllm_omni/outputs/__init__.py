@@ -57,6 +57,11 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
     omni_connector_output: OmniConnectorOutput | None = None
+    # Extra query tokens computed runner-locally in addition to the tokens
+    # represented by SchedulerOutput.num_scheduled_tokens.  This is used by
+    # tightly-scoped local decode loops (for example MiniCPM-o Talker) so the
+    # scheduler's KV/token accounting remains aligned with the worker.
+    local_computed_tokens: dict[str, int] | None = None
 
     @classmethod
     def with_kv_conn_output_only(cls, kv_connector_output: Any) -> "OmniModelRunnerOutput":

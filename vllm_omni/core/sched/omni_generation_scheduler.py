@@ -39,6 +39,26 @@ from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 logger = init_logger(__name__)
 
 
+def _multimodal_output_marks_turn_end(output: Any) -> bool:
+    if not isinstance(output, dict):
+        return False
+    value = output.get("meta.turn_end")
+    if value is None:
+        meta = output.get("meta")
+        value = meta.get("turn_end") if isinstance(meta, dict) else None
+    if value is None:
+        return False
+    if hasattr(value, "numel"):
+        if value.numel() == 0:
+            return False
+        value = value.reshape(-1)[0].item()
+    elif isinstance(value, (list, tuple)):
+        if not value:
+            return False
+        value = value[0]
+    return bool(value)
+
+
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -500,8 +520,10 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # One-shot generation request: finish after its current input unit
             # has been fully processed.
+            output_turn_end = self.chunk_transfer_adapter is not None and _multimodal_output_marks_turn_end(mm_output)
             if (
                 request.status == RequestStatus.FINISHED_STOPPED
+                or output_turn_end
                 or (self.chunk_transfer_adapter is None and request.num_computed_tokens >= request.num_prompt_tokens)
                 or (
                     self.chunk_transfer_adapter is not None

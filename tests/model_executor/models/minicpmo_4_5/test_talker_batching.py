@@ -13,6 +13,10 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     MiniCPMO45OmniTTSForConditionalGeneration,
+    _apply_repetition_penalty,
+    _apply_repetition_penalty_scatter,
+    _apply_top_k_top_p,
+    _compact_top_k_top_p_candidates,
     _max_audio_tokens,
     _restore_weight_norm_weight,
 )
@@ -59,6 +63,11 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._deferred_cleanup_ids = set()
     talker._codec_min_tokens = 50
     talker._codec_seed = 42
+    talker._talker_emit_codec_chunks = False
+    talker._talker_initial_codec_chunk_frames = 4
+    talker._talker_codec_chunk_frames = 25
+    talker._talker_compact_sampling = False
+    talker._talker_scatter_repetition = False
     return talker
 
 
@@ -99,6 +108,98 @@ def test_weight_norm_restore_matches_checkpoint_parametrization_in_bfloat16() ->
     restored = _restore_weight_norm_weight(weight_g, weight_v)
 
     assert torch.equal(restored, linear.weight)
+
+
+def test_repetition_penalty_matches_dense_reference() -> None:
+    generator = torch.Generator().manual_seed(42)
+    logits = torch.randn(2, 6562, generator=generator)
+    history = torch.tensor([3, 9, 3, 1024, 9, 9, 6550, 1, 2, 3, 4, 5, 6, 7, 8, 9, 3])
+    recent = history[-16:]
+    frequencies = torch.bincount(recent, minlength=logits.shape[-1]).to(logits.dtype)
+    alpha = torch.pow(torch.tensor(1.05, dtype=logits.dtype), frequencies)
+    expected = torch.where(logits < 0, logits * alpha, logits / alpha)
+
+    actual = _apply_repetition_penalty(
+        logits,
+        history,
+        penalty=1.05,
+        window_size=16,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_scatter_repetition_penalty_is_bit_exact(dtype: torch.dtype) -> None:
+    generator = torch.Generator().manual_seed(7)
+    logits = torch.randn(3, 6562, generator=generator, dtype=dtype)
+    history = torch.tensor([3, 9, 3, 1024, 9, 9, 6550, 1, 2, 3, 4, 5, 6, 7, 8, 9, 3])
+
+    expected = _apply_repetition_penalty(
+        logits,
+        history,
+        penalty=1.05,
+        window_size=16,
+    )
+    actual = _apply_repetition_penalty_scatter(
+        logits,
+        history,
+        penalty=1.05,
+        window_size=16,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("concentrated", [False, True])
+def test_top_k_top_p_matches_full_sort_reference(concentrated: bool) -> None:
+    generator = torch.Generator().manual_seed(123)
+    logits = torch.randn(3, 6562, generator=generator)
+    if concentrated:
+        logits[:, :8] += 12.0
+    sorted_logits, sorted_indices = torch.sort(logits, descending=False, dim=-1)
+    cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+    remove = cumulative_probs <= 0.15
+    remove[..., -3:] = False
+    remove = remove.scatter(-1, sorted_indices, remove)
+    expected = logits.masked_fill(remove, float("-inf"))
+    threshold = torch.topk(expected, 25, dim=-1).values[..., -1, None]
+    expected.masked_fill_(expected < threshold, float("-inf"))
+
+    actual = _apply_top_k_top_p(
+        logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+
+    assert torch.equal(torch.isfinite(actual), torch.isfinite(expected))
+    torch.testing.assert_close(actual[torch.isfinite(actual)], expected[torch.isfinite(expected)])
+
+
+def test_compact_top_k_candidates_preserve_dense_distribution() -> None:
+    generator = torch.Generator().manual_seed(17)
+    logits = torch.randn(2, 127, generator=generator)
+    dense = _apply_top_k_top_p(
+        logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+    candidate_logits, candidate_ids = _compact_top_k_top_p_candidates(
+        logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+
+    dense_probabilities = torch.softmax(dense, dim=-1)
+    compact_probabilities = torch.softmax(candidate_logits, dim=-1)
+    torch.testing.assert_close(
+        dense_probabilities.gather(-1, candidate_ids),
+        compact_probabilities,
+    )
+    assert torch.count_nonzero(dense_probabilities, dim=-1).tolist() == [25, 25]
 
 
 def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> None:
@@ -238,7 +339,9 @@ def test_eos_is_terminal_once_and_never_enters_codec_history(mocker) -> None:
     sample = mocker.patch.object(talker, "_sample_audio_code", return_value=torch.tensor(7))
     info = {
         "request_id": "req-stop",
-        "audio_state": {"step": 3},
+        # The real sampler masks EOS before min_tokens.  Set zero here because
+        # this test replaces the sampler with an unconditional EOS token.
+        "audio_state": {"step": 3, "min_tokens": 0},
         "audio_codes": {"accumulated": torch.tensor([4, 5])},
     }
 
@@ -261,6 +364,68 @@ def test_eos_is_terminal_once_and_never_enters_codec_history(mocker) -> None:
     assert second.multimodal_outputs["meta"]["finished"][0].item() is False
     assert first_logits.argmax(dim=-1).tolist() == [1]
     assert talker.compute_logits(second.text_hidden_states).argmax(dim=-1).tolist() == [1]
+
+
+def test_sparse_codec_output_emits_only_on_initial_and_steady_boundaries(mocker) -> None:
+    talker = _make_talker()
+    talker._talker_emit_codec_chunks = True
+    talker._talker_initial_codec_chunk_frames = 4
+    talker._talker_codec_chunk_frames = 5
+    samples = iter(range(1, 10))
+    mocker.patch.object(talker, "_sample_audio_code", side_effect=lambda *_: torch.tensor(next(samples)))
+    info = {
+        "request_id": "req-sparse",
+        "audio_state": {"step": 0, "min_tokens": 50, "max_tokens": 100},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    outputs = [
+        talker.make_omni_output(
+            torch.ones(1, 2),
+            model_intermediate_buffer=[info],
+            request_token_spans=[(0, 1)],
+        ).multimodal_outputs
+        for _ in range(9)
+    ]
+
+    for index in (0, 1, 2, 4, 5, 6, 7):
+        assert outputs[index]["meta"]["req_id"] == []
+        assert outputs[index]["codes"]["audio"] == []
+    assert outputs[3]["meta"]["req_id"] == ["req-sparse"]
+    assert outputs[3]["meta"]["sparse_audio"] == ["1"]
+    assert outputs[3]["codes"]["audio"][0].reshape(-1).tolist() == [1, 2, 3, 4]
+    assert outputs[8]["meta"]["req_id"] == ["req-sparse"]
+    assert outputs[8]["codes"]["audio"][0].reshape(-1).tolist() == [5, 6, 7, 8, 9]
+
+
+def test_sparse_codec_output_flushes_tail_with_terminal_marker(mocker) -> None:
+    talker = _make_talker()
+    talker._talker_emit_codec_chunks = True
+    talker._talker_initial_codec_chunk_frames = 4
+    talker._talker_codec_chunk_frames = 5
+    samples = iter([1, 2, 3, 4, 5, 6, 7])
+    mocker.patch.object(talker, "_sample_audio_code", side_effect=lambda *_: torch.tensor(next(samples)))
+    info = {
+        "request_id": "req-terminal",
+        "audio_state": {"step": 0, "min_tokens": 0, "max_tokens": 100},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    outputs = []
+    for _ in range(7):
+        outputs.append(
+            talker.make_omni_output(
+                torch.ones(1, 2),
+                model_intermediate_buffer=[info],
+                request_token_spans=[(0, 1)],
+            ).multimodal_outputs
+        )
+
+    assert outputs[3]["codes"]["audio"][0].reshape(-1).tolist() == [1, 2, 3, 4]
+    terminal = outputs[6]
+    assert terminal["meta"]["req_id"] == ["req-terminal"]
+    assert terminal["meta"]["finished"][0].item() is True
+    assert terminal["codes"]["audio"][0].reshape(-1).tolist() == [5, 6]
 
 
 def test_max_token_terminal_drops_unconsumed_codec_delta(mocker) -> None:

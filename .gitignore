@@ -238,6 +238,7 @@ Thumbs.db
 # Data files
 data/
 datasets/
+/features.npy
 *.csv
 *.json
 !tests/dfx/perf/tests/*.json

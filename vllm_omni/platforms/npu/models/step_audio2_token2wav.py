@@ -12,6 +12,7 @@ Ascend-specific workarounds that must not live in the shared GPU model file:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from types import MethodType
@@ -19,6 +20,7 @@ from types import MethodType
 import numpy as np
 import torch
 import torch.nn.functional as F
+import torch_npu
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -27,6 +29,72 @@ _PATCHED = False
 _original_ensure_models_loaded = None
 _original_forward = None
 _original_stream_chunk_for = None
+
+
+def _fused_rel_position_attention_forward(
+    self,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    pos_emb: torch.Tensor,
+    cache: torch.Tensor | None,
+):
+    """CosyVoice relative MHA with Ascend fused QK-softmax-AV.
+
+    The relative-position term remains exact and is supplied as PSE.  This
+    removes three eager operators per Conformer block whose first execution is
+    specialized to every prompt length on Ascend.
+    """
+    if mask.numel() != 0:
+        return self._minicpmo_original_forward(query, key, value, mask, pos_emb, cache)
+
+    q, k, v = self.forward_qkv(query, key, value)
+    if cache is not None and cache.numel() > 0:
+        key_cache, value_cache = torch.split(cache, cache.size(-1) // 2, dim=-1)
+        k = torch.cat((key_cache, k), dim=2)
+        v = torch.cat((value_cache, v), dim=2)
+    new_cache = torch.cat((k, v), dim=-1)
+
+    batch = int(pos_emb.shape[0])
+    p = self.linear_pos(pos_emb).view(batch, -1, self.h, self.d_k).transpose(1, 2)
+    q_by_time = q.transpose(1, 2)
+    q_with_bias_v = (q_by_time + self.pos_bias_v).transpose(1, 2)
+    relative_scores = torch.matmul(q_with_bias_v, p.transpose(-2, -1))
+    if relative_scores.shape[-1] != k.shape[2]:
+        relative_scores = self.rel_shift(relative_scores)
+
+    scale = 1.0 / math.sqrt(self.d_k)
+    attended = torch_npu.npu_fusion_attention(
+        q,
+        k,
+        v,
+        self.h,
+        "BNSD",
+        pse=relative_scores * scale,
+        scale=scale,
+        keep_prob=1.0,
+    )[0]
+    output = attended.transpose(1, 2).contiguous().view(
+        query.shape[0],
+        query.shape[1],
+        self.h * self.d_k,
+    )
+    return self.linear_out(output), new_cache
+
+
+def patch_minicpmo45_encoder_fused_attention(encoder: torch.nn.Module) -> int:
+    """Patch both CosyVoice Conformer stacks; return patched layer count."""
+    patched = 0
+    for layer in (*encoder.encoders, *encoder.up_encoders):
+        attention = layer.self_attn
+        if getattr(attention, "_minicpmo_npu_fused", False):
+            continue
+        attention._minicpmo_original_forward = attention.forward
+        attention.forward = MethodType(_fused_rel_position_attention_forward, attention)
+        attention._minicpmo_npu_fused = True
+        patched += 1
+    return patched
 
 
 def _linear_downsample_even_scale(x: torch.Tensor, scale: int) -> torch.Tensor:

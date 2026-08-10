@@ -126,6 +126,62 @@ def test_audio_continuity_aggregation():
     assert p99 is not None and p99 > 0.4
 
 
+def test_audio_chunk_rtf_aggregates_packets_not_requests():
+    """Chunk RTF pools steady audio packets and excludes requests with no second packet."""
+    first = _make_output(100)
+    first.audio_chunk_rtfs = [0.25, 0.50]
+    second = _make_output(100)
+    second.audio_chunk_rtfs = [0.75]
+    first_packet_only = _make_output(100)
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[first, second, first_packet_only],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0, 99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["audio_chunk_rtf"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    assert metrics.mean_audio_chunk_rtf == pytest.approx(0.5)
+    assert metrics.median_audio_chunk_rtf == pytest.approx(0.5)
+    assert dict(metrics.percentiles_audio_chunk_rtf)[99.0] == pytest.approx(0.745)
+
+
+def test_speak_generation_rtf_excludes_tail_packets():
+    output = _make_output(100)
+    output.audio_chunk_rtfs = [0.2, 0.4, 0.9]
+    output.audio_speak_generation_rtfs = [0.2, 0.4]
+    output.audio_speak_tail_rtfs = [0.9]
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=10.0,
+        tokenizer=None,
+        selected_percentiles=[50.0, 99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=[
+            "audio_chunk_rtf",
+            "audio_speak_generation_rtf",
+            "audio_speak_tail_rtf",
+        ],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+    )
+
+    assert metrics.mean_audio_chunk_rtf == pytest.approx(0.5)
+    assert metrics.mean_audio_speak_generation_rtf == pytest.approx(0.3)
+    assert metrics.mean_audio_speak_tail_rtf == pytest.approx(0.9)
+
+
 # ============================================================================
 # TTFT suppression for pure-audio (TTS) benchmarks
 # ============================================================================
@@ -161,6 +217,7 @@ def _make_tts_output(prompt_len: int) -> MixRequestFuncOutput:
     output.itl = []
     output.audio_ttfp = 0.05
     output.audio_rtf = 0.2
+    output.audio_chunk_rtfs = [0.1, 0.3]
     output.audio_duration = 5.0
     output.audio_frames = 120000
     output.input_audio_duration = 0.0
@@ -168,7 +225,14 @@ def _make_tts_output(prompt_len: int) -> MixRequestFuncOutput:
     return output
 
 
-_TTS_PERCENTILE_METRICS = ["ttft", "e2el", "audio_rtf", "audio_ttfp", "audio_duration"]
+_TTS_PERCENTILE_METRICS = [
+    "ttft",
+    "e2el",
+    "audio_rtf",
+    "audio_chunk_rtf",
+    "audio_ttfp",
+    "audio_duration",
+]
 
 
 def test_tts_benchmark_omits_ttft(capsys):

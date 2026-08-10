@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import copy
+from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -42,7 +44,7 @@ def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
 @dataclass(frozen=True)
 class PromptFeatures:
     speech_tokens: torch.Tensor
-    speaker_embedding: torch.Tensor
+    projected_speaker_embedding: torch.Tensor
     mels: torch.Tensor
 
 
@@ -60,12 +62,47 @@ class BatchedToken2Wav(nn.Module):
     asset loader and prompt feature extractor.
     """
 
-    def __init__(self, token2wav: Any):
+    def __init__(
+        self,
+        token2wav: Any,
+        *,
+        cfg_mode: str = "full",
+        solver: str = "euler",
+        prompt_bucket_frames: int = 0,
+        prompt_encoder_device: str | torch.device | None = None,
+    ):
         super().__init__()
+        if cfg_mode not in {"full", "conditional", "conditional_scale"}:
+            raise ValueError(
+                "MiniCPM-o Token2Wav cfg_mode must be one of "
+                "'full', 'conditional', or 'conditional_scale'"
+            )
         self._token2wav = token2wav
         self.flow = token2wav.flow
         self.hift = token2wav.hift
+        flow_parameter = next(self.flow.parameters(), None)
+        self.flow_device = (
+            flow_parameter.device if flow_parameter is not None else token2wav.speech_window.device
+        )
+        self.flow_dtype = flow_parameter.dtype if flow_parameter is not None else token2wav.speech_window.dtype
+        self.cfg_mode = cfg_mode
+        self.cfg_batch_multiplier = 2 if cfg_mode == "full" else 1
+        if solver not in {"euler", "rk4"}:
+            raise ValueError("MiniCPM-o Token2Wav solver must be 'euler' or 'rk4'")
+        self.solver = solver
+        self.prompt_bucket_frames = int(prompt_bucket_frames)
+        if self.prompt_bucket_frames < 0:
+            raise ValueError("prompt_bucket_frames must be >= 0")
+        self.prompt_encoder: nn.Module | None = None
+        if prompt_encoder_device is not None:
+            prompt_device = torch.device(prompt_encoder_device)
+            if prompt_device != self.flow_device:
+                self.prompt_encoder = copy.deepcopy(self.flow.encoder).to(prompt_device)
         hift_parameter = next(self.hift.parameters(), None)
+        self.hift_device = (
+            hift_parameter.device if hift_parameter is not None else token2wav.speech_window.device
+        )
+        self.hift_dtype = hift_parameter.dtype if hift_parameter is not None else token2wav.speech_window.dtype
         if hift_parameter is not None and hift_parameter.device.type == "cuda":
             # Prime the CUDA state used by HiFT during backend construction.
             # Otherwise, the first live audio chunk can fail when async stages
@@ -88,14 +125,143 @@ class BatchedToken2Wav(nn.Module):
             torch.accelerator.empty_cache()
         self.float16 = bool(token2wav.float16)
         self.n_timesteps = int(token2wav.n_timesteps)
+        if self.n_timesteps < 1:
+            raise ValueError("MiniCPM-o Token2Wav n_timesteps must be >= 1")
+        self.num_evaluations = self.n_timesteps * (4 if self.solver == "rk4" else 1)
         self.mel_cache_len = int(token2wav.mel_cache_len)
         self.source_cache_len = int(token2wav.source_cache_len)
+        timeline = torch.linspace(0, 1, self.n_timesteps + 1, dtype=torch.float32)
+        timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
+        self.register_buffer(
+            "cfm_timeline",
+            timeline.to(device=self.flow_device, dtype=self.flow_dtype),
+            persistent=False,
+        )
+        # Euler timesteps are fixed for the lifetime of the backend, and the
+        # DiT timestep MLP is in inference mode.  Cache its output once instead
+        # of rebuilding sinusoidal features (including device arange/exp/cos/
+        # sin kernels) for every step of every audio chunk.
+        if self.solver == "rk4":
+            starts = timeline[:-1]
+            ends = timeline[1:]
+            middles = (starts + ends) * 0.5
+            evaluation_times = torch.stack(
+                (starts, middles, middles, ends),
+                dim=1,
+            ).reshape(-1)
+        else:
+            evaluation_times = timeline[:-1]
+        self.register_buffer(
+            "cfm_evaluation_times",
+            evaluation_times.to(device=self.flow_device, dtype=self.flow_dtype),
+            persistent=False,
+        )
+        # Use normal no-grad tensors rather than inference tensors. Stage-2
+        # startup prewarm can be invoked from a context where autograd is
+        # technically enabled, and PyTorch rejects inference tensors saved by
+        # parameterized ops even though this model never calls backward.
+        with torch.no_grad():
+            time_embeddings = self.flow.decoder.estimator.t_embedder(self.cfm_evaluation_times).unsqueeze(1)
+        self.register_buffer(
+            "cfm_time_embeddings",
+            time_embeddings.detach(),
+            persistent=False,
+        )
+        # Every DiT block applies a large adaLN modulation projection to the
+        # timestep embedding.  Both the embedding and model weights are fixed
+        # during inference, so doing those projections in every block, Euler
+        # evaluation, audio chunk, and request is pure duplicate work.  Cache
+        # the exact projection outputs once and run a local block loop that
+        # consumes them.  Unknown estimator implementations retain the
+        # upstream blocks_forward_chunk fallback.
+        estimator = self.flow.decoder.estimator
+        final_layer = getattr(estimator, "final_layer", None)
+        modulation_supported = final_layer is not None and all(
+            all(
+                hasattr(block, name)
+                for name in ("adaLN_modulation", "norm1", "attn", "norm2", "mlp", "norm3", "conv")
+            )
+            for block in estimator.blocks
+        ) and all(
+            hasattr(final_layer, name)
+            for name in ("adaLN_modulation", "norm_final", "linear")
+        )
+        block_modulations = None
+        final_modulations = None
+        if modulation_supported:
+            with torch.no_grad():
+                block_modulations = torch.stack(
+                    [block.adaLN_modulation(time_embeddings) for block in estimator.blocks],
+                    dim=1,
+                ).detach()
+                final_modulations = final_layer.adaLN_modulation(time_embeddings).detach()
+        self.register_buffer(
+            "cfm_block_modulations",
+            block_modulations,
+            persistent=False,
+        )
+        self.register_buffer(
+            "cfm_final_modulations",
+            final_modulations,
+            persistent=False,
+        )
+        self.cached_dit_modulation = modulation_supported
         self.register_buffer(
             "speech_window",
             token2wav.speech_window.detach().clone(),
             persistent=False,
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
+        self._initial_states: dict[tuple[str, str], BatchedToken2WavState] = {}
+
+    def bucket_prompt_features(
+        self,
+        features: PromptFeatures,
+        target_frames: int | None = None,
+    ) -> PromptFeatures:
+        """Pad prompt conditioning to a reusable NPU shape bucket.
+
+        Ascend eager operators pay a multi-second first-use cost for every new
+        prompt sequence length.  Rounding only the cached conditioning suffix
+        lets a small set of shapes be warmed at startup.  Speaker extraction
+        remains based on the original waveform; the suffix uses the model's
+        silence codec token and repeats the final (normally silent) mel frame.
+        """
+        current_frames = int(features.speech_tokens.shape[1])
+        if target_frames is None:
+            bucket = self.prompt_bucket_frames
+            if bucket <= 0:
+                return features
+            target_frames = ((current_frames + bucket - 1) // bucket) * bucket
+        target_frames = int(target_frames)
+        if target_frames < current_frames:
+            raise ValueError(
+                f"target prompt bucket {target_frames} is below prompt length {current_frames}"
+            )
+        if target_frames == current_frames:
+            return features
+
+        token_padding = features.speech_tokens.new_full(
+            (features.speech_tokens.shape[0], target_frames - current_frames),
+            _SILENCE_TOKEN,
+        )
+        speech_tokens = torch.cat((features.speech_tokens, token_padding), dim=1)
+        up_rate = int(features.mels.shape[1]) // current_frames
+        if up_rate <= 0 or int(features.mels.shape[1]) != current_frames * up_rate:
+            raise ValueError(
+                "prompt mel frames must be an integer multiple of speech token frames"
+            )
+        target_mels = target_frames * up_rate
+        mel_padding = features.mels[:, -1:, :].expand(
+            -1,
+            target_mels - int(features.mels.shape[1]),
+            -1,
+        )
+        return PromptFeatures(
+            speech_tokens=speech_tokens,
+            projected_speaker_embedding=features.projected_speaker_embedding,
+            mels=torch.cat((features.mels, mel_padding), dim=1),
+        )
 
     def prepare_prompt(self, prompt_cache_id: str, prompt_wav: str) -> PromptFeatures:
         cache_key = (prompt_cache_id, prompt_wav)
@@ -111,25 +277,83 @@ class BatchedToken2Wav(nn.Module):
                     values = self._token2wav._prepare_prompt(prompt_wav)
             finally:
                 torch.set_default_dtype(previous_dtype)
-            cached = PromptFeatures(
-                speech_tokens=values[0],
-                speaker_embedding=values[2],
-                mels=values[3],
+            speaker_embedding = values[2].to(
+                device=self.flow_device,
+                dtype=self.flow_dtype,
             )
+            with self._autocast(speaker_embedding.device):
+                projected_speaker_embedding = self.flow.spk_embed_affine_layer(
+                    F.normalize(speaker_embedding, dim=1)
+                )
+            cached = self.bucket_prompt_features(PromptFeatures(
+                speech_tokens=values[0],
+                projected_speaker_embedding=projected_speaker_embedding,
+                mels=values[3].to(device=self.flow_device, dtype=self.flow_dtype),
+            ))
             self._prompt_features[cache_key] = cached
         return cached
 
     def evict_prompt(self, prompt_cache_id: str, prompt_wav: str) -> None:
         """Release request-owned prompt features after stream completion."""
-        self._prompt_features.pop((prompt_cache_id, prompt_wav), None)
+        cache_key = (prompt_cache_id, prompt_wav)
+        self._prompt_features.pop(cache_key, None)
+        self._initial_states.pop(cache_key, None)
+
+    def setup_cached_batch(
+        self,
+        prompt_cache_id: str,
+        prompt_wav: str,
+        batch_size: int,
+    ) -> tuple[PromptFeatures, list[BatchedToken2WavState]]:
+        """Reuse a deterministic, read-only prompt-initialized state.
+
+        Prompt encoding and the initial CFM cache construction depend only on
+        the reference prompt. Computing them for every request wastes most of
+        the Code2Wav work before the first live codec frame arrives. The
+        streaming encoder, DiT estimator, and HiFT vocoder treat their incoming
+        caches as read-only and return new cache tensors, so all new requests
+        can start from one immutable template without copying tens of MiB of
+        prompt attention state. The first live decode returns request-owned
+        states as usual.
+        """
+        if batch_size < 1:
+            raise ValueError("batch_size must be >= 1")
+        cache_key = (prompt_cache_id, prompt_wav)
+        features = self.prepare_prompt(prompt_cache_id, prompt_wav)
+        template = self._initial_states.get(cache_key)
+        if template is None:
+            template = self.setup_batch(features, 1)[0]
+            self._initial_states[cache_key] = template
+        return features, [template] * batch_size
 
     @staticmethod
-    def _repeat_prompt(features: PromptFeatures, batch_size: int) -> tuple[torch.Tensor, ...]:
+    def _repeat_prompt(features: PromptFeatures, batch_size: int) -> tuple[torch.Tensor, torch.Tensor]:
         return (
             features.speech_tokens.expand(batch_size, -1),
-            features.speaker_embedding.expand(batch_size, -1),
             features.mels.expand(batch_size, -1, -1),
         )
+
+    @staticmethod
+    def _speaker_batch(
+        features: PromptFeatures | Sequence[PromptFeatures],
+        batch_size: int,
+    ) -> torch.Tensor:
+        if isinstance(features, PromptFeatures):
+            return features.projected_speaker_embedding.expand(batch_size, -1)
+        if len(features) != batch_size:
+            raise ValueError(f"prompt feature batch {len(features)} != token batch {batch_size}")
+        if batch_size == 1:
+            return features[0].projected_speaker_embedding
+        return torch.cat([feature.projected_speaker_embedding for feature in features], dim=0)
+
+    @staticmethod
+    def _prompt_mel_length(features: PromptFeatures | Sequence[PromptFeatures]) -> int:
+        if isinstance(features, PromptFeatures):
+            return int(features.mels.shape[1])
+        lengths = {int(feature.mels.shape[1]) for feature in features}
+        if len(lengths) != 1:
+            raise ValueError(f"mixed prompt mel lengths cannot share one cache batch: {sorted(lengths)}")
+        return lengths.pop()
 
     def _autocast(self, device: torch.device):
         if device.type != "cuda":
@@ -158,22 +382,39 @@ class BatchedToken2Wav(nn.Module):
         last_chunk: bool,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
+        prompt: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        embedded = self.flow.input_embedding(tokens)
-        hidden, new_cnn, new_att = self.flow.encoder.forward_chunk(
+        encoder = self.prompt_encoder if prompt and self.prompt_encoder is not None else self.flow.encoder
+        encoder_parameter = next(encoder.parameters(), None)
+        encoder_device = encoder_parameter.device if encoder_parameter is not None else self.flow_device
+        encoder_dtype = encoder_parameter.dtype if encoder_parameter is not None else self.flow_dtype
+        embedded = self.flow.input_embedding(tokens).to(
+            device=encoder_device,
+            dtype=encoder_dtype,
+        )
+        if cnn_cache is not None:
+            cnn_cache = cnn_cache.to(device=encoder_device, dtype=encoder_dtype)
+        if att_cache is not None:
+            att_cache = att_cache.to(device=encoder_device, dtype=encoder_dtype)
+        hidden, new_cnn, new_att = encoder.forward_chunk(
             xs=embedded,
             last_chunk=last_chunk,
             cnn_cache=cnn_cache,
             att_cache=att_cache,
         )
-        return self.flow.encoder_proj(hidden), new_cnn, new_att
+        hidden = hidden.to(device=self.flow_device, dtype=self.flow_dtype)
+        return (
+            self.flow.encoder_proj(hidden),
+            new_cnn.to(device=self.flow_device, dtype=self.flow_dtype),
+            new_att.to(device=self.flow_device, dtype=self.flow_dtype),
+        )
 
     @staticmethod
-    def _estimator_buffers(
+    def _estimator_buffer_shapes(
         estimator: nn.Module,
         x: torch.Tensor,
         old_att: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
         blocks = estimator.blocks
         depth = len(blocks)
         batch_size = int(x.shape[0])
@@ -184,9 +425,10 @@ class BatchedToken2Wav(nn.Module):
         cnn_width = int(block0.conv.block[1].causal_padding[0])
         heads = int(block0.attn.num_heads)
         att_width = int(block0.attn.head_dim * 2)
-        cnn = x.new_empty((depth, batch_size, cnn_channels, cnn_width))
-        att = x.new_empty((depth, batch_size, heads, old_att_len + chunk_size, att_width))
-        return cnn, att
+        return (
+            (depth, batch_size, cnn_channels, cnn_width),
+            (depth, batch_size, heads, old_att_len + chunk_size, att_width),
+        )
 
     def _estimator_step(
         self,
@@ -194,29 +436,109 @@ class BatchedToken2Wav(nn.Module):
         *,
         x: torch.Tensor,
         mu: torch.Tensor,
-        time: torch.Tensor,
+        time_embedding: torch.Tensor,
         speakers: torch.Tensor,
         cond: torch.Tensor,
+        evaluation: int,
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        time_embedding = estimator.t_embedder(time).unsqueeze(1)
+        cnn_out: torch.Tensor,
+        att_out: torch.Tensor,
+    ) -> torch.Tensor:
         width = int(x.shape[-1])
         speaker_features = speakers.unsqueeze(-1).expand(-1, -1, width)
         estimator_input = torch.cat((x, mu, speaker_features, cond), dim=1)
-        cnn_out, att_out = self._estimator_buffers(estimator, estimator_input, att_cache)
         old_cnn: Any = cnn_cache if cnn_cache is not None else [None] * len(estimator.blocks)
         old_att: Any = att_cache if att_cache is not None else [None] * len(estimator.blocks)
-        result = estimator.blocks_forward_chunk(
+        if not self.cached_dit_modulation:
+            return estimator.blocks_forward_chunk(
+                estimator_input,
+                time_embedding,
+                None,
+                old_cnn,
+                old_att,
+                cnn_out,
+                att_out,
+            )
+        return self._estimator_blocks_forward_chunk_cached_modulation(
+            estimator,
             estimator_input,
-            time_embedding,
-            None,
-            old_cnn,
-            old_att,
-            cnn_out,
-            att_out,
+            evaluation=evaluation,
+            cnn_cache=old_cnn,
+            att_cache=old_att,
+            cnn_out=cnn_out,
+            att_out=att_out,
         )
-        return result, cnn_out, att_out
+
+    @staticmethod
+    def _modulate(
+        value: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return value * (1.0 + scale) + shift
+
+    def _estimator_blocks_forward_chunk_cached_modulation(
+        self,
+        estimator: nn.Module,
+        estimator_input: torch.Tensor,
+        *,
+        evaluation: int,
+        cnn_cache: Any,
+        att_cache: Any,
+        cnn_out: torch.Tensor,
+        att_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the upstream DiT block loop with exact cached adaLN outputs."""
+        if self.cfm_block_modulations is None or self.cfm_final_modulations is None:
+            raise RuntimeError("cached DiT modulation buffers are unavailable")
+
+        hidden = estimator.in_proj(estimator_input.transpose(1, 2))
+        batch_size = int(hidden.shape[0])
+        for block_index, block in enumerate(estimator.blocks):
+            modulation = self.cfm_block_modulations[evaluation, block_index].expand(
+                batch_size,
+                -1,
+                -1,
+            )
+            (
+                shift_msa,
+                scale_msa,
+                gate_msa,
+                shift_mlp,
+                scale_mlp,
+                gate_mlp,
+                shift_conv,
+                scale_conv,
+                gate_conv,
+            ) = modulation.chunk(9, dim=-1)
+
+            attention, new_att = block.attn.forward_chunk(
+                self._modulate(block.norm1(hidden), shift_msa, scale_msa),
+                att_cache[block_index],
+                None,
+            )
+            hidden = hidden + gate_msa * attention
+            convolution, new_cnn = block.conv.forward_chunk(
+                self._modulate(block.norm3(hidden), shift_conv, scale_conv),
+                cnn_cache[block_index],
+            )
+            hidden = hidden + gate_conv * convolution
+            hidden = hidden + gate_mlp * block.mlp(
+                self._modulate(block.norm2(hidden), shift_mlp, scale_mlp)
+            )
+
+            cnn_out[block_index].copy_(new_cnn)
+            att_out[block_index, :, :, : new_att.shape[2], :].copy_(new_att)
+
+        final_modulation = self.cfm_final_modulations[evaluation].expand(
+            batch_size,
+            -1,
+            -1,
+        )
+        shift, scale = final_modulation.chunk(2, dim=-1)
+        hidden = self._modulate(estimator.final_layer.norm_final(hidden), shift, scale)
+        return estimator.final_layer.linear(hidden).transpose(1, 2)
 
     def _decode_cfm(
         self,
@@ -239,73 +561,145 @@ class BatchedToken2Wav(nn.Module):
                 f'"available":{int(decoder.rand_noise.shape[2])}}}'
             )
         x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
-        timeline = torch.linspace(
-            0,
-            1,
-            self.n_timesteps + 1,
-            device=mu.device,
-            dtype=mu.dtype,
+        timeline = self.cfm_timeline
+        if timeline.device != mu.device or timeline.dtype != mu.dtype:
+            timeline = timeline.to(device=mu.device, dtype=mu.dtype)
+        if self.cfg_mode == "full":
+            model_mu = torch.cat((mu, torch.zeros_like(mu)), dim=0)
+            model_speakers = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
+            model_cond = torch.cat((cond, torch.zeros_like(cond)), dim=0)
+        else:
+            model_mu = mu
+            model_speakers = speakers
+            model_cond = cond
+        model_batch_size = self.cfg_batch_multiplier * batch_size
+        first_old_att = att_cache[0] if att_cache is not None else None
+        cnn_shape, att_shape = self._estimator_buffer_shapes(
+            estimator,
+            model_mu,
+            first_old_att,
         )
-        timeline = 1 - torch.cos(timeline * 0.5 * torch.pi)
-        time = timeline[0].expand(batch_size)
-        mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=0)
-        speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
-        cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
-        next_cnn: list[torch.Tensor] = []
-        next_att: list[torch.Tensor] = []
-        dt = timeline[1] - timeline[0]
-        for step in range(self.n_timesteps):
-            old_cnn = cnn_cache[step] if cnn_cache is not None else None
-            old_att = att_cache[step] if att_cache is not None else None
-            estimate, step_cnn, step_att = self._estimator_step(
+        # Allocate the final stacked cache once and let every Euler step write
+        # directly into its contiguous slice.  The previous implementation
+        # allocated two tensors per step and copied all of them again through
+        # torch.stack at the end of every audio chunk.
+        next_cnn = mu.new_empty((self.num_evaluations, *cnn_shape))
+        next_att = mu.new_empty((self.num_evaluations, *att_shape))
+
+        def evaluate(latent: torch.Tensor, evaluation: int) -> torch.Tensor:
+            old_cnn = cnn_cache[evaluation] if cnn_cache is not None else None
+            old_att = att_cache[evaluation] if att_cache is not None else None
+            # CFG evaluates the conditional and unconditional branches with
+            # the same latent.  The score-critical single-request path can
+            # expose two read-only rows through a stride-0 view instead of
+            # allocating and copying ``x`` at every Euler step.  Keep the
+            # existing materialized layout for real batches because flattening
+            # a repeated multi-row batch cannot be represented as one view.
+            if self.cfg_mode == "full":
+                model_x = (
+                    latent.expand(2, -1, -1)
+                    if batch_size == 1
+                    else torch.cat((latent, latent), dim=0)
+                )
+            else:
+                model_x = latent
+            estimate = self._estimator_step(
                 estimator,
-                x=torch.cat((x, x), dim=0),
-                mu=mu_cfg,
-                time=torch.cat((time, time), dim=0),
-                speakers=speakers_cfg,
-                cond=cond_cfg,
+                x=model_x,
+                mu=model_mu,
+                time_embedding=self.cfm_time_embeddings[evaluation : evaluation + 1].expand(
+                    model_batch_size,
+                    -1,
+                    -1,
+                ),
+                speakers=model_speakers,
+                cond=model_cond,
+                evaluation=evaluation,
                 cnn_cache=old_cnn,
                 att_cache=old_att,
+                cnn_out=next_cnn[evaluation],
+                att_out=next_att[evaluation],
             )
-            conditional, unconditional = estimate.split(batch_size, dim=0)
-            velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
-            x = x + dt * velocity
-            time = time + dt
-            if step + 1 < self.n_timesteps:
-                dt = timeline[step + 2] - time[0]
-            next_cnn.append(step_cnn)
-            next_att.append(step_att)
-        return x, torch.stack(next_cnn), torch.stack(next_att)
+            if self.cfg_mode == "full":
+                conditional, unconditional = estimate.split(batch_size, dim=0)
+                return (
+                    (1.0 + decoder.inference_cfg_rate) * conditional
+                    - decoder.inference_cfg_rate * unconditional
+                )
+            if self.cfg_mode == "conditional_scale":
+                return (1.0 + decoder.inference_cfg_rate) * estimate
+            return estimate
 
-    @staticmethod
-    def _split_flow_cache(cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
+        if self.solver == "rk4":
+            for step in range(self.n_timesteps):
+                dt = timeline[step + 1] - timeline[step]
+                evaluation = step * 4
+                k1 = evaluate(x, evaluation)
+                k2 = evaluate(x + 0.5 * dt * k1, evaluation + 1)
+                k3 = evaluate(x + 0.5 * dt * k2, evaluation + 2)
+                k4 = evaluate(x + dt * k3, evaluation + 3)
+                x = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        else:
+            for step in range(self.n_timesteps):
+                dt = timeline[step + 1] - timeline[step]
+                x = x + dt * evaluate(x, step)
+        return x, next_cnn, next_att
+
+    def _split_flow_cache(
+        self,
+        cache: dict[str, torch.Tensor],
+        batch_size: int,
+    ) -> list[dict[str, torch.Tensor]]:
+        if batch_size == 1:
+            return [
+                {
+                    "conformer_cnn_cache": cache["conformer_cnn_cache"].detach(),
+                    "conformer_att_cache": cache["conformer_att_cache"].detach(),
+                    "estimator_cnn_cache": cache["estimator_cnn_cache"].detach(),
+                    "estimator_att_cache": cache["estimator_att_cache"].detach(),
+                }
+            ]
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
+            if self.cfg_mode == "full":
+                estimator_cnn = torch.cat(
+                    (
+                        cache["estimator_cnn_cache"][:, :, row : row + 1],
+                        cache["estimator_cnn_cache"][:, :, batch_size + row : batch_size + row + 1],
+                    ),
+                    dim=2,
+                ).detach()
+                estimator_att = torch.cat(
+                    (
+                        cache["estimator_att_cache"][:, :, row : row + 1],
+                        cache["estimator_att_cache"][:, :, batch_size + row : batch_size + row + 1],
+                    ),
+                    dim=2,
+                ).detach()
+            else:
+                estimator_cnn = cache["estimator_cnn_cache"][:, :, row : row + 1].detach().clone()
+                estimator_att = cache["estimator_att_cache"][:, :, row : row + 1].detach().clone()
             result.append(
                 {
                     "conformer_cnn_cache": cache["conformer_cnn_cache"][row : row + 1].detach().clone(),
                     "conformer_att_cache": cache["conformer_att_cache"][:, row : row + 1].detach().clone(),
-                    "estimator_cnn_cache": torch.cat(
-                        (
-                            cache["estimator_cnn_cache"][:, :, row : row + 1],
-                            cache["estimator_cnn_cache"][:, :, batch_size + row : batch_size + row + 1],
-                        ),
-                        dim=2,
-                    ).detach(),
-                    "estimator_att_cache": torch.cat(
-                        (
-                            cache["estimator_att_cache"][:, :, row : row + 1],
-                            cache["estimator_att_cache"][:, :, batch_size + row : batch_size + row + 1],
-                        ),
-                        dim=2,
-                    ).detach(),
+                    "estimator_cnn_cache": estimator_cnn,
+                    "estimator_att_cache": estimator_att,
                 }
             )
         return result
 
-    @staticmethod
-    def _stack_flow_cache(states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
+    def _stack_flow_cache(self, states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
         flows = [state.flow_cache for state in states]
+        if len(flows) == 1:
+            return dict(flows[0])
+        if self.cfg_mode != "full":
+            return {
+                "conformer_cnn_cache": torch.cat([flow["conformer_cnn_cache"] for flow in flows], dim=0),
+                "conformer_att_cache": torch.cat([flow["conformer_att_cache"] for flow in flows], dim=1),
+                "estimator_cnn_cache": torch.cat([flow["estimator_cnn_cache"] for flow in flows], dim=2),
+                "estimator_att_cache": torch.cat([flow["estimator_att_cache"] for flow in flows], dim=2),
+            }
         conditional_cnn = [flow["estimator_cnn_cache"][:, :, 0:1] for flow in flows]
         unconditional_cnn = [flow["estimator_cnn_cache"][:, :, 1:2] for flow in flows]
         conditional_att = [flow["estimator_att_cache"][:, :, 0:1] for flow in flows]
@@ -322,7 +716,7 @@ class BatchedToken2Wav(nn.Module):
         features: PromptFeatures,
         batch_size: int,
     ) -> list[BatchedToken2WavState]:
-        prompt_tokens, speakers, prompt_mels = self._repeat_prompt(features, batch_size)
+        prompt_tokens, prompt_mels = self._repeat_prompt(features, batch_size)
         lookahead_width = self._pre_lookahead_len()
         lookahead = prompt_tokens.new_full(
             (batch_size, 3 if lookahead_width is None else lookahead_width),
@@ -334,11 +728,11 @@ class BatchedToken2Wav(nn.Module):
                 last_chunk=False,
                 cnn_cache=None,
                 att_cache=None,
+                prompt=True,
             )
-            projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
             _, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
-                projected_speakers,
+                features.projected_speaker_embedding.expand(batch_size, -1),
                 prompt_mels.transpose(1, 2).contiguous(),
                 cnn_cache=None,
                 att_cache=None,
@@ -355,9 +749,21 @@ class BatchedToken2Wav(nn.Module):
             BatchedToken2WavState(
                 flow_cache=row,
                 hift_cache={
-                    "mel": prompt_mels.new_zeros((1, mel_channels, 0)),
-                    "source": prompt_mels.new_zeros((1, 1, 0)),
-                    "speech": prompt_mels.new_zeros((1, 0)),
+                    "mel": torch.zeros(
+                        (1, mel_channels, 0),
+                        device=self.hift_device,
+                        dtype=self.hift_dtype,
+                    ),
+                    "source": torch.zeros(
+                        (1, 1, 0),
+                        device=self.hift_device,
+                        dtype=self.hift_dtype,
+                    ),
+                    "speech": torch.zeros(
+                        (1, 0),
+                        device=self.hift_device,
+                        dtype=self.hift_dtype,
+                    ),
                 },
             )
             for row in split
@@ -384,7 +790,7 @@ class BatchedToken2Wav(nn.Module):
     def decode_batch(
         self,
         tokens: torch.Tensor,
-        features: PromptFeatures,
+        features: PromptFeatures | Sequence[PromptFeatures],
         states: list[BatchedToken2WavState],
         *,
         last_chunk: bool,
@@ -407,7 +813,7 @@ class BatchedToken2Wav(nn.Module):
                     f'"minimum":{lookahead + 1}}}'
                 )
         flow_cache = self._stack_flow_cache(states)
-        speakers = features.speaker_embedding.expand(batch_size, -1)
+        speakers = self._speaker_batch(features, batch_size)
         with self._autocast(tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 tokens,
@@ -415,17 +821,16 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=flow_cache["conformer_cnn_cache"],
                 att_cache=flow_cache["conformer_att_cache"],
             )
-            projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
-                projected_speakers,
+                speakers,
                 cond,
                 cnn_cache=flow_cache["estimator_cnn_cache"],
                 att_cache=flow_cache["estimator_att_cache"],
             )
 
-        prompt_len = int(features.mels.shape[1])
+        prompt_len = self._prompt_mel_length(features)
         if estimator_att.shape[4] > prompt_len + 100:
             estimator_att = torch.cat(
                 (estimator_att[..., :prompt_len, :], estimator_att[..., -100:, :]),
@@ -445,9 +850,15 @@ class BatchedToken2Wav(nn.Module):
             },
             batch_size,
         )
-        old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
-        old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
-        old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
+        if batch_size == 1:
+            old_mel = states[0].hift_cache["mel"]
+            old_source = states[0].hift_cache["source"]
+            old_speech = states[0].hift_cache["speech"]
+        else:
+            old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
+            old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
+            old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
+        chunk_mel = chunk_mel.to(device=old_mel.device, dtype=old_mel.dtype)
         mel = torch.cat((old_mel, chunk_mel), dim=2)
         speech, source = self.hift(mel, old_source)
         if old_speech.shape[-1] > 0:
@@ -459,12 +870,20 @@ class BatchedToken2Wav(nn.Module):
             "speech": speech[..., -self.source_cache_len :].detach(),
         }
         emitted = speech if last_chunk else speech[..., : -self.source_cache_len]
-        next_states = [
-            BatchedToken2WavState(
-                flow_cache=new_flow[row],
-                hift_cache={name: value[row : row + 1].detach().clone() for name, value in next_hift.items()},
-            )
-            for row in range(batch_size)
-        ]
+        if batch_size == 1:
+            next_states = [
+                BatchedToken2WavState(
+                    flow_cache=new_flow[0],
+                    hift_cache={name: value.detach() for name, value in next_hift.items()},
+                )
+            ]
+        else:
+            next_states = [
+                BatchedToken2WavState(
+                    flow_cache=new_flow[row],
+                    hift_cache={name: value[row : row + 1].detach().clone() for name, value in next_hift.items()},
+                )
+                for row in range(batch_size)
+            ]
         audios = [emitted[row].reshape(-1).to(dtype=torch.float32) for row in range(batch_size)]
         return audios, next_states

@@ -231,6 +231,7 @@ def _build_common_args(
         host=ns.host,
         port=ns.port,
         model=ns.model,
+        served_model_name=ns.served_model_name,
         num_prompts=ns.num_prompts,
         max_concurrency=ns.max_concurrency,
         num_warmups=ns.num_warmups,
@@ -361,6 +362,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Qwen/Qwen3-Omni-30B-A3B-Instruct",
         ),
         help="Model id passed to ``vllm bench serve`` (must match the running server).",
+    )
+    p.add_argument(
+        "--served-model-name",
+        default=os.environ.get("ACC_BENCH_SERVED_MODEL_NAME"),
+        help="Optional API model name when --model is a local tokenizer/checkpoint path.",
     )
     p.add_argument("--num-prompts", type=int, default=int(os.environ.get("ACC_BENCH_NUM_PROMPTS", "2000")))
     p.add_argument("--max-concurrency", type=int, default=int(os.environ.get("ACC_BENCH_MAX_CONCURRENCY", "10")))

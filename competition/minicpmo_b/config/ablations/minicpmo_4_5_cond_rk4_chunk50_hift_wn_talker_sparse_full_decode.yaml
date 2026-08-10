@@ -1,0 +1,106 @@
+# Stage-1 full-decode graph ablation derived from the current best candidate.
+# Only the Stage 1 NPU compilation mode changes: FULL_DECODE_ONLY enables
+# Npugraph_ex + ACLGraph capture/replay for uniform autoregressive decode.
+# Capture sizes are deliberately limited to the supported low-concurrency
+# competition range to reduce capture time and graph resource pressure.
+pipeline: minicpmo_4_5
+async_chunk: true
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      code2wav_cache_initial_state: true
+      code2wav_cross_prompt_batching: true
+      code2wav_prewarm: true
+      token2wav_cfg_mode: conditional
+      token2wav_solver: rk4
+      token2wav_n_timesteps: 1
+      token2wav_remove_hift_weight_norm: true
+      talker_emit_codec_chunks: true
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 50
+      codec_left_context_frames: 3
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.55
+    enforce_eager: false
+    tensor_parallel_size: 1
+    max_num_batched_tokens: 16384
+    max_model_len: 32768
+    devices: "0"
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
+    limit_mm_per_prompt:
+      image: 96
+      audio: 64
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.15
+    enforce_eager: false
+    max_num_batched_tokens: 8192
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      min_tokens: 50
+      max_tokens: 2048
+      stop_token_ids: [1]
+      seed: 42
+      detokenize: false
+
+  - stage_id: 2
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.18
+    enforce_eager: true
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: true
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: FULL_DECODE_ONLY
+          cudagraph_capture_sizes: [1, 2, 4]
+          cudagraph_num_of_warmups: 1

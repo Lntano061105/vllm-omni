@@ -189,7 +189,9 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
             "vllm_itls_ms": [10.0, 14.0, 18.0],
         }
     }
-    for received_at_s, cumulative_audio_ms in ((10.2, 80), (10.25, 160), (10.36, 240)):
+    for index, (received_at_s, cumulative_audio_ms) in enumerate(
+        ((10.2, 80), (10.25, 160), (10.36, 240))
+    ):
         collector.add(
             {
                 "type": "response.audio.delta",
@@ -198,6 +200,8 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
                 "sample_rate_hz": 16_000,
                 "metadata": {
                     "audio_duration_ms": cumulative_audio_ms,
+                    "speak_tail": index >= 2,
+                    "end_of_turn": index == 2,
                     "vllm_omni": {"stage_metrics": stage_metrics},
                 },
             },
@@ -263,6 +267,9 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
             "max": 80.0,
         },
         "max_chunk_gap_ms": 110.0,
+        "phase_source": "response.audio.delta metadata.speak_tail",
+        "speak_generation_chunk_rtfs": [0.625],
+        "speak_tail_chunk_rtfs": [1.375],
     }
     assert timing["request_metrics"] == {
         "source": "client_monotonic_receive",
@@ -276,7 +283,39 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
         "rtf": pytest.approx(1.916667),
         "audio_generation_ms": 460.0,
         "audio_duration_ms": 240.0,
+        "speak_generation_chunk_rtfs": [0.625],
+        "speak_tail_chunk_rtfs": [1.375],
+        "speak_generation_rtf": 0.625,
+        "speak_tail_rtf": 1.375,
     }
+
+
+def test_response_timing_does_not_guess_speak_phase_without_explicit_boundary():
+    collector = RealtimeEventCollector()
+    collector.add(
+        {"type": "response.created", "response": {"id": "resp-a"}},
+        received_at_s=10.0,
+    )
+    for index, received_at_s in enumerate((10.1, 10.2, 10.3), start=1):
+        collector.add(
+            {
+                "type": "response.audio.delta",
+                "response_id": "resp-a",
+                "delta": base64.b64encode(b"audio").decode("ascii"),
+                "metadata": {
+                    "audio_duration_ms": index * 100,
+                    "end_of_turn": index == 3,
+                },
+            },
+            received_at_s=received_at_s,
+        )
+
+    timing = collector.timing_summary(after_s=10.0, response_id="resp-a")
+
+    assert timing["audio_output"]["speak_generation_chunk_rtfs"] == []
+    assert timing["audio_output"]["speak_tail_chunk_rtfs"] == []
+    assert timing["request_metrics"]["speak_generation_rtf"] is None
+    assert timing["request_metrics"]["speak_tail_rtf"] is None
 
 
 def test_response_timing_ignores_unowned_session_level_metrics():

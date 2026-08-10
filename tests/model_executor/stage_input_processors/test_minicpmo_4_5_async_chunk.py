@@ -17,9 +17,12 @@ from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _manager():
+def _manager(*, initial_chunk_frames: int = 0):
+    extra = {"codec_chunk_frames": 25, "codec_left_context_frames": 3}
+    if initial_chunk_frames:
+        extra["initial_codec_chunk_frames"] = initial_chunk_frames
     return SimpleNamespace(
-        connector=SimpleNamespace(config={"extra": {"codec_chunk_frames": 25, "codec_left_context_frames": 3}}),
+        connector=SimpleNamespace(config={"extra": extra}),
         code_prompt_token_ids=defaultdict(list),
         request_payload={},
         put_req_chunk=defaultdict(int),
@@ -101,6 +104,49 @@ def test_steady_chunk_has_three_code_overlap_and_25_new_codes() -> None:
     assert steady is not None
     assert _codes(steady) == [22, 23, 24, *range(25, 50)]
     assert steady.meta.chunk_seq == 1
+
+
+@pytest.mark.parametrize(("count", "emitted"), [(3, False), (4, True), (5, True)])
+def test_configured_initial_chunk_emits_before_steady_threshold(count: int, emitted: bool) -> None:
+    manager = _manager(initial_chunk_frames=4)
+    payload = tts2code2wav_async_chunk(
+        transfer_manager=manager,
+        multimodal_output=_delta(*range(count)),
+        request=_request("req"),
+        is_finished=False,
+    )
+
+    assert (payload is not None) is emitted
+    if payload is not None:
+        assert _codes(payload) == [4218, 4218, 4218, *range(4)]
+        assert payload.meta.chunk_seq == 0
+        assert payload.meta.codec_chunk_frames == 4
+        assert payload.meta.code_flat_numel == 7
+
+
+def test_configured_initial_chunk_returns_to_steady_chunk_size() -> None:
+    manager = _manager(initial_chunk_frames=4)
+    request = _request("req")
+
+    first = tts2code2wav_async_chunk(manager, _delta(*range(4)), request, False)
+    manager.put_req_chunk["req"] += 1
+    before_steady = tts2code2wav_async_chunk(manager, _delta(*range(4, 28)), request, False)
+    steady = tts2code2wav_async_chunk(manager, _delta(28), request, False)
+
+    assert first is not None
+    assert before_steady is None
+    assert steady is not None
+    assert _codes(steady) == [1, 2, 3, *range(4, 29)]
+    assert steady.meta.chunk_seq == 1
+    assert steady.meta.codec_chunk_frames == 25
+
+
+def test_initial_chunk_larger_than_steady_is_clamped() -> None:
+    manager = _manager(initial_chunk_frames=50)
+    payload = tts2code2wav_async_chunk(manager, _delta(*range(25)), _request("req"), False)
+
+    assert payload is not None
+    assert payload.meta.codec_chunk_frames == 25
 
 
 def test_exact_boundary_final_flushes_held_lookahead() -> None:
@@ -281,6 +327,28 @@ def test_empty_duplex_boundary_uses_zero_length_transport_placeholder() -> None:
     )
 
 
+def test_duplex_model_terminal_metadata_flushes_segment_before_request_status() -> None:
+    manager = _manager()
+    request = _request("req-duplex")
+    terminal = _duplex_delta(text="boundary")
+    terminal["meta"]["finished"] = torch.tensor(True)
+
+    boundary = tts2code2wav_async_chunk(
+        manager,
+        terminal,
+        request,
+        is_finished=False,
+    )
+
+    assert request.status == RequestStatus.RUNNING
+    assert boundary is not None
+    assert _codes(boundary) == [0]
+    assert boundary.meta.code_flat_numel == 0
+    assert boundary.meta.last_chunk is False
+    assert boundary.meta.tts_is_last_chunk is True
+    assert boundary.meta.turn_end is False
+
+
 def test_duplex_segments_preserve_stream_state_without_closing_turn() -> None:
     manager = _manager()
     request = _request("req-duplex")
@@ -433,11 +501,38 @@ def test_duplex_turn_end_closes_epoch_and_next_turn_restarts_sequence() -> None:
     assert turn_end is not None
     assert next_turn is not None
     assert turn_end.meta.last_chunk is True
+    assert turn_end.meta.speak_tail is True
     assert turn_end.meta.turn_end is True
     assert turn_end.meta.is_segment_finished.item() is True
     assert next_turn.meta.cache_epoch == turn_end.meta.cache_epoch + 1
     assert next_turn.meta.chunk_seq == 0
+    assert next_turn.meta.speak_tail is False
     assert next_turn.meta.last_chunk is False
+
+
+def test_duplex_turn_end_marks_every_draining_codec_payload_as_speak_tail() -> None:
+    manager = _manager()
+    request = _request("req-duplex")
+
+    body = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(25), turn_end=True),
+        request,
+        False,
+    )
+    final = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(25, turn_end=True),
+        request,
+        True,
+    )
+
+    assert body is not None
+    assert body.meta.speak_tail is True
+    assert body.meta.turn_end is False
+    assert final is not None
+    assert final.meta.speak_tail is True
+    assert final.meta.turn_end is True
 
 
 def test_staggered_requests_keep_accumulators_isolated() -> None:

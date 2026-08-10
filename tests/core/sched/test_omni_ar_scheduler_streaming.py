@@ -61,6 +61,7 @@ def _run_resumable_segment_stop(
     session: Request,
     *,
     session_finished: bool = False,
+    local_computed_tokens: dict[str, int] | None = None,
 ):
     sched = MagicMock()
     sched.requests = {session.request_id: session}
@@ -83,6 +84,10 @@ def _run_resumable_segment_stop(
     sched.kv_cache_manager.take_events.return_value = None
     sched.finished_req_ids_dict = {}
     sched.make_stats.return_value = None
+    sched.talker_local_decode_steps = max(
+        (local_computed_tokens or {}).values(),
+        default=0,
+    ) + 1
 
     scheduler_output = MagicMock(spec=SchedulerOutput)
     scheduler_output.num_scheduled_tokens = {session.request_id: 1}
@@ -99,8 +104,26 @@ def _run_resumable_segment_stop(
     model_runner_output.cudagraph_stats = None
     model_runner_output.req_id_to_index = {session.request_id: 0}
     model_runner_output.routed_experts = None
+    model_runner_output.local_computed_tokens = local_computed_tokens
 
     return OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
+
+
+@pytest.mark.parametrize("local_steps", [2, 4])
+def test_runner_local_decode_advances_scheduler_computed_tokens(local_steps: int) -> None:
+    session = _make_request()
+    session.status = RequestStatus.RUNNING
+    session.num_computed_tokens = session.num_prompt_tokens + 1
+
+    extra_steps = local_steps - 1
+    _run_resumable_segment_stop(
+        session,
+        local_computed_tokens={session.request_id: extra_steps},
+    )
+
+    # One token was already accounted by schedule(); the runner reports the
+    # remaining KV queries that it executed locally.
+    assert session.num_computed_tokens == session.num_prompt_tokens + local_steps
 
 
 @pytest.mark.parametrize("outstanding_async_tokens", [0, 1, 2])

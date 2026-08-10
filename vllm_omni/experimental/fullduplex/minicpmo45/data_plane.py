@@ -223,6 +223,7 @@ class MiniCPMO45DataPlaneSession:
             )
         )
         stage_turn_end = _bool_metadata(mm_output, ("turn_end", "end_of_turn"), default=False)
+        speak_tail = _bool_metadata(mm_output, ("speak_tail",), default=False)
         terminal_turn_state = request_state.turn(output_turn_id) if request_state is not None else None
         stage_tts_eos = (
             context.auto_responds
@@ -264,6 +265,7 @@ class MiniCPMO45DataPlaneSession:
                     audio_duration_ms=duration_ms,
                     audio_text_mark=idx == last_idx,
                     sample_rate_hz=sample_rate_hz,
+                    speak_tail=speak_tail,
                     end_of_turn=unit_end_of_turn and idx == last_idx,
                     abort_data_plane_request=tts_segment_end and idx == last_idx,
                 )

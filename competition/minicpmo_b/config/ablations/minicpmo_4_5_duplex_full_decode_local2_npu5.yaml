@@ -1,0 +1,13 @@
+# Native full-duplex local2 profile pinned to physical NPU 5.
+base_config: minicpmo_4_5_duplex_full_decode_local2.yaml
+pipeline: minicpmo_4_5
+
+stages:
+  - stage_id: 0
+    devices: "5"
+
+  - stage_id: 1
+    devices: "5"
+
+  - stage_id: 2
+    devices: "5"

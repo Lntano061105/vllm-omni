@@ -50,6 +50,7 @@ from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
+from vllm_omni.worker.talker_local_decode import talker_state_allows_local_step
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -108,6 +109,31 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        connector_config = getattr(self.model_config, "stage_connector_config", None)
+        if isinstance(connector_config, dict):
+            connector_extra = connector_config.get("extra", connector_config)
+        else:
+            connector_extra = getattr(connector_config, "extra", None)
+        connector_extra = connector_extra if isinstance(connector_extra, dict) else {}
+        try:
+            configured_local_steps = int(connector_extra.get("talker_local_decode_steps", 1) or 1)
+            local_decode_stage_id = int(connector_extra.get("talker_local_decode_stage_id", 1))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "talker_local_decode_steps and talker_local_decode_stage_id must be integers"
+            ) from exc
+        current_stage_id = int(getattr(self.model_config, "stage_id", -1))
+        self.talker_local_decode_steps = (
+            configured_local_steps if current_stage_id == local_decode_stage_id else 1
+        )
+        if self.talker_local_decode_steps not in (1, 2, 4):
+            raise ValueError(
+                "talker_local_decode_steps must be 1, 2, or 4, "
+                f"got {self.talker_local_decode_steps}"
+            )
+        if self.talker_local_decode_steps > 1 and self.use_async_scheduling:
+            raise ValueError("talker_local_decode_steps>1 requires async_scheduling=false")
+        self._talker_direct_local_state: tuple[list[str], int] | None = None
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
@@ -146,11 +172,137 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        if self.talker_local_decode_steps > 1:
+            if not getattr(self.model, "supports_talker_local_decode", False):
+                raise ValueError(
+                    "talker_local_decode_steps>1 is only supported by a model "
+                    "that declares supports_talker_local_decode"
+                )
+            logger.info("NPU Talker runner-local decode enabled with %d steps", self.talker_local_decode_steps)
 
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
         return deferred_state_corrections_fn
+
+    def _can_run_direct_talker_next_step(
+        self,
+        scheduler_output: SchedulerOutput,
+        multimodal_outputs: Any,
+    ) -> bool:
+        if (
+            self.talker_local_decode_steps <= 1
+            or self.use_async_scheduling
+            or self.speculative_config is not None
+            or not getattr(self.model, "supports_talker_local_decode", False)
+            or get_pp_group().world_size != 1
+            or scheduler_output.scheduled_new_reqs
+            or scheduler_output.scheduled_spec_decode_tokens
+            or scheduler_output.scheduled_encoder_inputs
+            or getattr(scheduler_output, "has_structured_output_requests", False)
+        ):
+            return False
+        req_ids = self.input_batch.req_ids
+        if not req_ids or set(req_ids) != set(scheduler_output.num_scheduled_tokens):
+            return False
+        if any(count != 1 for count in scheduler_output.num_scheduled_tokens.values()):
+            return False
+        # The direct path intentionally drops the first substep's wire payload.
+        # Sparse 4/50-frame chunking emits only on even codec steps, so the
+        # first step of each local pair must have an explicit empty sparse set.
+        if self._sparse_mm_req_ids(multimodal_outputs) != []:
+            return False
+        for req_id in req_ids:
+            req_index = self.input_batch.req_id_to_index.get(req_id)
+            request = self.requests.get(req_id)
+            info = self.model_intermediate_buffer.get(req_id)
+            state = info.get("audio_state") if isinstance(info, dict) else None
+            if (
+                req_index is None
+                or request is None
+                or request.pooling_params is not None
+                or not isinstance(state, dict)
+                or bool(state.get("finished"))
+                or not talker_state_allows_local_step(state)
+                or int(self.input_batch.num_computed_tokens_cpu[req_index])
+                < int(self.input_batch.num_prompt_tokens[req_index])
+            ):
+                return False
+            sampling_params = request.sampling_params
+            if getattr(sampling_params, "num_logprobs", None) is not None:
+                return False
+            max_tokens = getattr(sampling_params, "max_tokens", None)
+            # output_token_ids does not include the just-computed local token
+            # yet, so reserve one position for it before deciding to continue.
+            if max_tokens is not None and len(request.output_token_ids) + 1 >= int(max_tokens):
+                return False
+        return True
+
+    def _account_direct_talker_continue_tokens(self, req_ids: list[str]) -> None:
+        """Mirror synchronous bookkeeping for the first local continue token."""
+        for req_id in req_ids:
+            req_index = self.input_batch.req_id_to_index[req_id]
+            start_idx = int(self.input_batch.num_tokens_no_spec[req_index])
+            if start_idx >= self.max_model_len:
+                raise RuntimeError(f"Talker local decode exceeds max_model_len for {req_id}")
+            self.input_batch.token_ids_cpu[req_index, start_idx] = 0
+            self.input_batch.is_token_ids[req_index, start_idx] = True
+            self.input_batch.num_tokens_no_spec[req_index] = start_idx + 1
+            self.input_batch.num_tokens[req_index] = start_idx + 1
+            self.input_batch.num_computed_tokens_cpu[req_index] += 1
+            req_state = self.requests[req_id]
+            req_state.output_token_ids.append(0)
+            req_state.num_computed_tokens += 1
+
+    def _prepare_direct_talker_next_inputs(
+        self,
+        req_ids: list[str],
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        num_reqs = len(req_ids)
+        for req_index, req_id in enumerate(req_ids):
+            info = self.model_intermediate_buffer[req_id]
+            request = self.requests[req_id]
+            prompt_len = len(request.prompt_token_ids or ())
+            info["request_id"] = req_id
+            info["_omni_prompt_len"] = prompt_len
+            info["_omni_num_computed_tokens"] = int(
+                self.input_batch.num_computed_tokens_cpu[req_index]
+            )
+            info["_omni_is_prefill"] = False
+            req_input_ids, req_embeds, updates = self.model.preprocess(
+                input_ids=input_ids[req_index : req_index + 1],
+                input_embeds=inputs_embeds[req_index : req_index + 1],
+                **info,
+            )
+            inputs_embeds[req_index : req_index + 1].copy_(req_embeds[:1])
+            if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == 1:
+                input_ids[req_index : req_index + 1].copy_(req_input_ids.reshape(-1))
+            if updates:
+                self._update_intermediate_buffer(req_id, updates)
+
+        # Update only the decode tensors whose values advance between the two
+        # local queries. The block table already includes the scheduler-owned
+        # lookahead slot and query_start_loc remains [0, 1, ..., batch].
+        self.num_computed_tokens[:num_reqs].copy_(
+            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+            non_blocking=True,
+        )
+        positions[:num_reqs].copy_(self.num_computed_tokens[:num_reqs].to(torch.int64))
+        self.seq_lens[:num_reqs] = self.num_computed_tokens[:num_reqs] + 1
+        torch.add(
+            self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
+            1,
+            out=self.optimistic_seq_lens_cpu[:num_reqs],
+        )
+        self.input_batch.block_table.compute_slot_mapping(
+            num_reqs,
+            self.query_start_loc.gpu[: num_reqs + 1],
+            positions[:num_reqs],
+        )
+        update_cos_sin(positions)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -745,6 +897,75 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
 
+            # MiniCPM-o Talker fast path: the first substep has already sampled
+            # its codec token inside make_omni_output(). When it is a pure
+            # continue step with no sparse wire payload, feed that codec
+            # embedding straight back into the same resident batch and replay
+            # one more target-model query. This avoids a scheduler IPC round,
+            # _update_states(), full _prepare_inputs(), and first-step output
+            # bookkeeping while preserving one-token attention semantics.
+            direct_req_ids = list(req_ids[:num_reqs])
+            direct_extra_steps = 0
+            while (
+                direct_extra_steps < self.talker_local_decode_steps - 1
+                and self._can_run_direct_talker_next_step(
+                    scheduler_output,
+                    multimodal_outputs,
+                )
+            ):
+                self._account_direct_talker_continue_tokens(direct_req_ids)
+                self._prepare_direct_talker_next_inputs(
+                    direct_req_ids,
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                )
+                (
+                    local_attn_metadata,
+                    local_spec_decode_common_attn_metadata,
+                ) = self._build_attention_metadata(
+                    num_tokens=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=1,
+                    ubatch_slices=ubatch_slices_attn,
+                    logits_indices=logits_indices,
+                    use_spec_decode=False,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    cascade_attn_prefix_lens=None,
+                )
+                with (
+                    record_function_or_nullcontext("talker_local_forward"),
+                    set_ascend_forward_context(
+                        local_attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        aclgraph_runtime_mode=cudagraph_mode,
+                        batch_descriptor=batch_desc,
+                        num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                        model_instance=self.model,
+                        max_tokens_across_pcp=0,
+                        skip_compiled=False,
+                    ),
+                ):
+                    hidden_states = self._model_forward(
+                        num_tokens_padded,
+                        input_ids,
+                        positions,
+                        intermediate_tensors,
+                        inputs_embeds,
+                        **model_kwargs,
+                    )
+                hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
+                attn_metadata = local_attn_metadata
+                spec_decode_common_attn_metadata = local_spec_decode_common_attn_metadata
+                direct_extra_steps += 1
+            if direct_extra_steps:
+                self._talker_direct_local_state = (direct_req_ids, direct_extra_steps)
+
             if multimodal_outputs is not None:
                 keys_or_type = (
                     list(multimodal_outputs.keys())
@@ -1027,6 +1248,24 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             spec_decode_metadata,
         )
 
+        direct_local_state = self._talker_direct_local_state
+        self._talker_direct_local_state = None
+        local_computed_tokens: dict[str, int] | None = None
+        if direct_local_state is not None:
+            direct_local_req_ids, direct_extra_steps = direct_local_state
+            if req_ids_output_copy != direct_local_req_ids:
+                raise RuntimeError(
+                    "Direct Talker local decode changed request order: "
+                    f"expected={direct_local_req_ids}, actual={req_ids_output_copy}"
+                )
+            if len(valid_sampled_token_ids) != len(direct_local_req_ids):
+                raise RuntimeError("Direct Talker local decode returned an incomplete sampled-token batch")
+            for token_ids in valid_sampled_token_ids:
+                token_ids[:0] = [0] * direct_extra_steps
+            local_computed_tokens = {
+                req_id: direct_extra_steps for req_id in direct_local_req_ids
+            }
+
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 use_padded_batch = (
@@ -1059,14 +1298,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         sparse_mm_req_ids = self._sparse_mm_req_ids(multimodal_outputs)
         sparse_mm_index = {rid: i for i, rid in enumerate(sparse_mm_req_ids or [])}
-        if engine_output_type == "audio" and sparse_mm_req_ids is not None:
+        if sparse_mm_req_ids is not None:
             sparse_req_id_set = set(sparse_mm_req_ids)
             downstream_req_ids = [rid for rid in req_ids_output_copy if rid in sparse_req_id_set]
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
-        audio_sparse_output = engine_output_type == "audio" and sparse_mm_req_ids is not None
+        audio_sparse_output = sparse_mm_req_ids is not None
         needs_scheduled_hidden_payload = needs_pooler_payload and (
             self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states()
         )
@@ -1238,6 +1477,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             kv_connector_output=kv_connector_output,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
+            local_computed_tokens=local_computed_tokens,
         )
         model_runner_output.kv_extracted_req_ids = kv_extracted_req_ids
         model_runner_output.routed_experts = routed_experts_lists

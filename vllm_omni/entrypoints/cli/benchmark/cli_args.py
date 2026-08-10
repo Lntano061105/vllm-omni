@@ -292,7 +292,9 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
                 'For text metrics, "ttft", "tpot", and "itl" affect the global benchmark and text '
                 'stage metrics. "tpop" also requests text TPOT/TPOP globally and per stage, and internal '
                 'stream TPOP. "ttfc", "tpoc", and "icl" only affect internal stream stage metrics. '
-                'Audio metrics include "audio_ttfp", "audio_rtf", "audio_duration", and "audio_underrun".'
+                'Audio metrics include "audio_ttfp", "audio_rtf", "audio_chunk_rtf", '
+                '"audio_speak_generation_rtf", "audio_speak_tail_rtf", '
+                '"audio_duration", and "audio_underrun".'
             )
         if action.dest == "random_mm_limit_mm_per_prompt":
             action.help = (

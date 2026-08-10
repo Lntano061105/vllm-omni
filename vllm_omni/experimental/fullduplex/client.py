@@ -63,12 +63,38 @@ def summarize_session_request_metrics(
         ]
         return round(sum(values) / len(values), digits) if values else None
 
+    def pooled(metric: str) -> list[float]:
+        return [
+            float(value)
+            for request in request_metrics
+            for value in (
+                request.get(metric)
+                if isinstance(request.get(metric), list)
+                else []
+            )
+            if isinstance(value, int | float) and math.isfinite(float(value))
+        ]
+
+    speak_generation_rtfs = pooled("speak_generation_chunk_rtfs")
+    speak_tail_rtfs = pooled("speak_tail_chunk_rtfs")
     return {
         "session_id": session_id,
         "audio_turn_count": len(request_metrics),
         "mean_ttft_ms": mean("ttft_ms"),
         "mean_ttfp_ms": mean("ttfp_ms"),
         "mean_rtf": mean("rtf", digits=6),
+        "mean_speak_generation_rtf": (
+            round(sum(speak_generation_rtfs) / len(speak_generation_rtfs), 6)
+            if speak_generation_rtfs
+            else None
+        ),
+        "speak_generation_chunk_count": len(speak_generation_rtfs),
+        "mean_speak_tail_rtf": (
+            round(sum(speak_tail_rtfs) / len(speak_tail_rtfs), 6)
+            if speak_tail_rtfs
+            else None
+        ),
+        "speak_tail_chunk_count": len(speak_tail_rtfs),
     }
 
 
@@ -239,6 +265,7 @@ class RealtimeEventCollector:
         first_text_received_at_s: float | None = None
         audio_received_at_s: list[float] = []
         cumulative_audio_ms: list[float] = []
+        audio_tail_flags: list[bool | None] = []
         for event, received_at_s in zip(self.events, self.event_received_at_s, strict=True):
             if received_at_s < after_s:
                 continue
@@ -277,6 +304,10 @@ class RealtimeEventCollector:
             duration_ms = metadata.get("audio_duration_ms") if isinstance(metadata, dict) else None
             if isinstance(duration_ms, int | float) and math.isfinite(float(duration_ms)):
                 cumulative_audio_ms.append(max(0.0, float(duration_ms)))
+            else:
+                cumulative_audio_ms.append(float("nan"))
+            raw_speak_tail = metadata.get("speak_tail") if isinstance(metadata, dict) else None
+            audio_tail_flags.append(raw_speak_tail if isinstance(raw_speak_tail, bool) else None)
 
         result: dict[str, object] = {}
         if stage0_metrics is not None:
@@ -301,10 +332,33 @@ class RealtimeEventCollector:
             chunk_durations_ms: list[float] = []
             previous_duration_ms = 0.0
             for duration_ms in cumulative_audio_ms:
+                if not math.isfinite(duration_ms):
+                    chunk_durations_ms.append(0.0)
+                    continue
                 chunk_durations_ms.append(
                     duration_ms - previous_duration_ms if duration_ms >= previous_duration_ms else duration_ms
                 )
                 previous_duration_ms = duration_ms
+            speak_generation_chunk_rtfs: list[float] = []
+            speak_tail_chunk_rtfs: list[float] = []
+            for index in range(1, len(audio_received_at_s)):
+                chunk_duration_ms = chunk_durations_ms[index]
+                if chunk_duration_ms <= 0:
+                    continue
+                rtf = compute_audio_rtf(
+                    audio_received_at_s[index] - audio_received_at_s[index - 1],
+                    chunk_duration_ms / 1000.0,
+                )
+                # Only publish the competition phase proxy when the server
+                # explicitly propagated the Thinker/Talker boundary.  Falling
+                # back to ``end_of_turn`` would misclassify all but the final
+                # downstream tail packet as SPEAK generation.
+                if audio_tail_flags[index] is None:
+                    continue
+                if audio_tail_flags[index]:
+                    speak_tail_chunk_rtfs.append(round(rtf, 6))
+                else:
+                    speak_generation_chunk_rtfs.append(round(rtf, 6))
             interval_summary = _interval_summary(intervals_ms)
             result["audio_output"] = {
                 "source": "client_monotonic_receive",
@@ -322,12 +376,18 @@ class RealtimeEventCollector:
                 "inter_chunk_interval_ms": interval_summary,
                 "chunk_duration_ms": _interval_summary(chunk_durations_ms),
                 "max_chunk_gap_ms": interval_summary["max"],
+                "phase_source": "response.audio.delta metadata.speak_tail",
+                "speak_generation_chunk_rtfs": speak_generation_chunk_rtfs,
+                "speak_tail_chunk_rtfs": speak_tail_chunk_rtfs,
             }
             request_started_at_s = input_committed_at_s if input_committed_at_s is not None else response_created_at_s
             if request_started_at_s is not None:
+                finite_cumulative_audio_ms = [
+                    value for value in cumulative_audio_ms if math.isfinite(value)
+                ]
                 audio_duration_ms = (
-                    max(cumulative_audio_ms)
-                    if cumulative_audio_ms
+                    max(finite_cumulative_audio_ms)
+                    if finite_cumulative_audio_ms
                     else len(self.audio_bytes(response_id))
                     * 1000.0
                     / (self.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
@@ -361,6 +421,18 @@ class RealtimeEventCollector:
                     else None,
                     "audio_generation_ms": _rounded_ms(audio_generation_ms),
                     "audio_duration_ms": _rounded_ms(audio_duration_ms),
+                    "speak_generation_chunk_rtfs": speak_generation_chunk_rtfs,
+                    "speak_tail_chunk_rtfs": speak_tail_chunk_rtfs,
+                    "speak_generation_rtf": (
+                        round(sum(speak_generation_chunk_rtfs) / len(speak_generation_chunk_rtfs), 6)
+                        if speak_generation_chunk_rtfs
+                        else None
+                    ),
+                    "speak_tail_rtf": (
+                        round(sum(speak_tail_chunk_rtfs) / len(speak_tail_chunk_rtfs), 6)
+                        if speak_tail_chunk_rtfs
+                        else None
+                    ),
                 }
         return result
 

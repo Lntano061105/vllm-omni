@@ -997,6 +997,7 @@ class NativeRuntimeBridgeMixin:
                 "text": text if isinstance(text, str) else "",
                 "end_of_turn": end_of_turn,
                 "model_speak": True,
+                "speak_tail": bool(native_result.get("speak_tail", False)),
             }
             self._attach_native_runtime_metadata(
                 speak_payload,
@@ -1050,6 +1051,7 @@ class NativeRuntimeBridgeMixin:
             ),
             "end_of_turn": end_of_turn,
             "model_speak": True,
+            "speak_tail": bool(native_result.get("speak_tail", False)),
         }
         if mark_duration_ms is not None:
             payload["audio_duration_ms"] = mark_duration_ms

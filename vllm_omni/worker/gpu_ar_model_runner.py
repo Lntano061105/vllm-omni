@@ -473,7 +473,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     ) -> tuple[list[str], dict[str, int], bool]:
         sparse_mm_req_ids = GPUARModelRunner._sparse_mm_req_ids(multimodal_outputs)
         sparse_mm_index = {rid: i for i, rid in enumerate(sparse_mm_req_ids or [])}
-        if engine_output_type != "audio" or sparse_mm_req_ids is None:
+        # ``sparse_audio`` describes the payload, not necessarily the stage's
+        # final output type.  A latent Talker stage can emit sparse codec
+        # chunks to a downstream Code2Wav stage and needs the same compact
+        # routing / hidden-state D2H skip as a single-stage audio model.
+        if sparse_mm_req_ids is None:
             return downstream_req_ids, sparse_mm_index, False
 
         sparse_req_id_set = set(sparse_mm_req_ids)

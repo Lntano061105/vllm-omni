@@ -200,6 +200,7 @@ def build_serve_common_argv(
     host: str,
     port: int,
     model: str,
+    served_model_name: str | None = None,
     num_prompts: int,
     max_concurrency: int,
     num_warmups: int,
@@ -246,6 +247,8 @@ def build_serve_common_argv(
     ]
     if ready_check_timeout_sec is not None:
         out.extend(["--ready-check-timeout-sec", str(int(ready_check_timeout_sec))])
+    if served_model_name:
+        out.extend(["--served-model-name", served_model_name])
     if trust_remote_code:
         out.append("--trust-remote-code")
     if temperature is not None:
