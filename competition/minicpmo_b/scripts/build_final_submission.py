@@ -9,20 +9,17 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import BinaryIO, Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_ROOT = REPO_ROOT / "competition/minicpmo_b/results/official_910c"
 ARCHIVE_PREFIX = "minicpmo_b_official_910c"
-
-
-def _sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def _sha256_file(path: Path) -> str:
@@ -31,6 +28,54 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_stream(handle: BinaryIO) -> str:
+    digest = hashlib.sha256()
+    while True:
+        chunk = handle.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_bounded(handle: BinaryIO, size: int, *, limit: int, label: str) -> bytes:
+    if size > limit:
+        raise ValueError(f"{label} exceeds {limit} bytes")
+    payload = handle.read(limit + 1)
+    if len(payload) > limit:
+        raise ValueError(f"{label} exceeds {limit} bytes")
+    return payload
+
+
+def _atomic_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    publish_succeeded = False
+    try:
+        with tmp.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _backup_for_rollback(source: Path, target: Path) -> None:
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
 
 
 def collect_evidence_files(result_root: Path, output_dir: Path) -> list[tuple[str, Path]]:
@@ -149,59 +194,221 @@ def write_deterministic_archive(
         tmp.unlink(missing_ok=True)
 
 
-def verify_archive(archive: Path) -> dict[str, object]:
+def verify_archive(
+    archive: Path,
+    *,
+    expected_files: Iterable[tuple[str, Path]] | None = None,
+) -> dict[str, object]:
     failures: list[str] = []
-    content: dict[str, bytes] = {}
-    with tarfile.open(archive, mode="r:gz") as tar:
-        for member in tar.getmembers():
-            pure = PurePosixPath(member.name)
-            if pure.is_absolute() or ".." in pure.parts:
-                failures.append(f"unsafe archive path: {member.name}")
-                continue
-            if not member.isfile():
-                failures.append(f"non-regular archive member: {member.name}")
-                continue
-            if member.name in content:
-                failures.append(f"duplicate archive member: {member.name}")
-                continue
-            extracted = tar.extractfile(member)
-            if extracted is None:
-                failures.append(f"cannot read archive member: {member.name}")
-                continue
-            content[member.name] = extracted.read()
+    actual: dict[str, str] = {}
+    manifest_raw: bytes | None = None
+    metadata_raw: bytes | None = None
+    reserved = {"PACKAGE_FILE_SHA256.txt", "PACKAGE_METADATA.json"}
+    try:
+        with tarfile.open(archive, mode="r:gz") as tar:
+            for member in tar:
+                pure = PurePosixPath(member.name)
+                if pure.is_absolute() or ".." in pure.parts:
+                    failures.append(f"unsafe archive path: {member.name}")
+                    continue
+                if not member.isfile():
+                    failures.append(f"non-regular archive member: {member.name}")
+                    continue
+                if member.name in actual or (
+                    member.name == "PACKAGE_FILE_SHA256.txt" and manifest_raw is not None
+                ) or (
+                    member.name == "PACKAGE_METADATA.json" and metadata_raw is not None
+                ):
+                    failures.append(f"duplicate archive member: {member.name}")
+                    continue
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    failures.append(f"cannot read archive member: {member.name}")
+                    continue
+                try:
+                    if member.name == "PACKAGE_FILE_SHA256.txt":
+                        manifest_raw = _read_bounded(
+                            extracted,
+                            member.size,
+                            limit=16 * 1024 * 1024,
+                            label=member.name,
+                        )
+                    elif member.name == "PACKAGE_METADATA.json":
+                        metadata_raw = _read_bounded(
+                            extracted,
+                            member.size,
+                            limit=1024 * 1024,
+                            label=member.name,
+                        )
+                    else:
+                        actual[member.name] = _sha256_stream(extracted)
+                except ValueError as exc:
+                    failures.append(str(exc))
+    except (OSError, tarfile.TarError, EOFError) as exc:
+        failures.append(f"cannot read final archive: {exc}")
 
-    manifest_raw = content.get("PACKAGE_FILE_SHA256.txt")
-    metadata_raw = content.get("PACKAGE_METADATA.json")
     if manifest_raw is None:
         failures.append("archive is missing PACKAGE_FILE_SHA256.txt")
     if metadata_raw is None:
         failures.append("archive is missing PACKAGE_METADATA.json")
-    expected_names: set[str] = set()
+    expected: dict[str, str] = {}
     if manifest_raw is not None:
-        for line_number, line in enumerate(manifest_raw.decode("utf-8").splitlines(), 1):
-            try:
-                expected, name = line.split(None, 1)
-            except ValueError:
+        try:
+            manifest_text = manifest_raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            failures.append(f"package manifest is not UTF-8: {exc}")
+            manifest_text = ""
+        for line_number, line in enumerate(manifest_text.splitlines(), 1):
+            parts = line.split(None, 1)
+            if len(parts) != 2 or len(parts[0]) != 64 or any(
+                char not in "0123456789abcdefABCDEF" for char in parts[0]
+            ):
                 failures.append(f"invalid package manifest line {line_number}")
                 continue
-            name = name.strip()
-            expected_names.add(name)
-            payload = content.get(name)
-            if payload is None:
+            digest, name = parts[0].lower(), parts[1].strip()
+            pure = PurePosixPath(name)
+            if not name or pure.is_absolute() or ".." in pure.parts or name in reserved:
+                failures.append(f"unsafe package manifest target: {name!r}")
+                continue
+            if name in expected:
+                failures.append(f"duplicate package manifest entry: {name}")
+                continue
+            expected[name] = digest
+        for name, digest in expected.items():
+            if name not in actual:
                 failures.append(f"manifest target missing from archive: {name}")
-            elif _sha256_bytes(payload) != expected:
+            elif actual[name] != digest:
                 failures.append(f"archive member SHA256 mismatch: {name}")
-    actual_evidence = set(content) - {"PACKAGE_FILE_SHA256.txt", "PACKAGE_METADATA.json"}
-    extras = sorted(actual_evidence - expected_names)
+    extras = sorted(set(actual) - set(expected))
     if extras:
         failures.append("archive members absent from manifest: " + ", ".join(extras))
+    if expected_files is not None:
+        authoritative: dict[str, str] = {}
+        for name, path in expected_files:
+            if name in authoritative:
+                failures.append(f"duplicate authoritative evidence path: {name}")
+                continue
+            authoritative[name] = _sha256_file(path)
+        missing_from_archive = sorted(set(authoritative) - set(actual))
+        unexpected_in_archive = sorted(set(actual) - set(authoritative))
+        if missing_from_archive:
+            failures.append(
+                "archive is missing authoritative evidence: "
+                + ", ".join(missing_from_archive)
+            )
+        if unexpected_in_archive:
+            failures.append(
+                "archive contains non-authoritative evidence: "
+                + ", ".join(unexpected_in_archive)
+            )
+        for name in sorted(set(authoritative) & set(actual)):
+            if authoritative[name] != actual[name]:
+                failures.append(
+                    f"archive evidence differs from current authoritative file: {name}"
+                )
+    metadata: dict[str, object] | None = None
+    if metadata_raw is not None:
+        try:
+            value = json.loads(metadata_raw)
+            if not isinstance(value, dict):
+                raise ValueError("root is not an object")
+            metadata = value
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            failures.append(f"invalid package metadata: {exc}")
+    if metadata is not None:
+        if metadata.get("format_version") != 1:
+            failures.append("package metadata format_version is not 1")
+        if metadata.get("official_910c_evidence") is not True:
+            failures.append("package metadata is not official_910c_evidence=true")
+        if metadata.get("final_evidence_passed") is not True:
+            failures.append("package metadata final_evidence_passed is not true")
+        if metadata.get("evidence_file_count") != len(actual):
+            failures.append("package metadata evidence_file_count mismatch")
+    try:
+        archive_sha256 = _sha256_file(archive)
+    except OSError as exc:
+        failures.append(f"cannot hash final archive: {exc}")
+        archive_sha256 = None
     return {
         "passed": not failures,
-        "archive": str(archive),
-        "archive_sha256": _sha256_file(archive),
-        "evidence_file_count": len(actual_evidence),
+        "archive": archive.name,
+        "archive_sha256": archive_sha256,
+        "evidence_file_count": len(actual),
         "failures": failures,
     }
+
+
+def publish_package_set(
+    *,
+    candidate: Path,
+    archive: Path,
+    verification_path: Path,
+    sha256_path: Path,
+    expected_files: Iterable[tuple[str, Path]],
+) -> dict[str, object]:
+    verification = verify_archive(candidate, expected_files=expected_files)
+    if verification.get("passed") is not True:
+        candidate.unlink(missing_ok=True)
+        raise ValueError(
+            "final archive verification failed:\n"
+            + json.dumps(verification, ensure_ascii=False, indent=2)
+        )
+    archive.parent.mkdir(parents=True, exist_ok=True)
+    rollback = archive.parent / f".rollback-{os.getpid()}"
+    rollback.mkdir(parents=True, exist_ok=False)
+    published = (archive, verification_path, sha256_path)
+    existed = {path: path.is_file() for path in published}
+    rollback_incomplete = False
+    try:
+        for path in published:
+            if existed[path]:
+                _backup_for_rollback(path, rollback / path.name)
+        os.replace(candidate, archive)
+        _fsync_directory(archive.parent)
+        verification["archive"] = archive.name
+        _atomic_bytes(
+            verification_path,
+            (
+                json.dumps(
+                    verification, ensure_ascii=False, indent=2, sort_keys=True
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
+        _atomic_bytes(
+            sha256_path,
+            f"{verification['archive_sha256']}  {archive.name}\n".encode("utf-8"),
+        )
+        _fsync_directory(archive.parent)
+    except BaseException as publish_exc:
+        restore_failures: list[str] = []
+        for path in published:
+            backup = rollback / path.name
+            try:
+                if existed[path] and backup.is_file():
+                    os.replace(backup, path)
+                elif not existed[path]:
+                    path.unlink(missing_ok=True)
+            except OSError as restore_exc:
+                restore_failures.append(f"{path}: {restore_exc}")
+        candidate.unlink(missing_ok=True)
+        try:
+            _fsync_directory(archive.parent)
+        except OSError as restore_exc:
+            restore_failures.append(
+                f"fsync {archive.parent}: {restore_exc}"
+            )
+        if restore_failures:
+            rollback_incomplete = True
+            raise RuntimeError(
+                "package publication failed and rollback was incomplete; preserve "
+                f"{rollback} for manual recovery: " + "; ".join(restore_failures)
+            ) from publish_exc
+        raise
+    finally:
+        if not rollback_incomplete:
+            shutil.rmtree(rollback, ignore_errors=True)
+    return verification
 
 
 def main() -> int:
@@ -246,22 +453,21 @@ def main() -> int:
         "evidence_file_count": len(files),
     }
     archive = output_dir / f"{ARCHIVE_PREFIX}.tar.gz"
-    write_deterministic_archive(archive, files, metadata=metadata)
-    verification = verify_archive(archive)
-    if not verification["passed"]:
-        archive.unlink(missing_ok=True)
-        raise SystemExit(
-            "final archive verification failed:\n"
-            + json.dumps(verification, ensure_ascii=False, indent=2)
+    candidate = output_dir / f".{archive.name}.candidate-{os.getpid()}"
+    candidate.unlink(missing_ok=True)
+    write_deterministic_archive(candidate, files, metadata=metadata)
+    verification_path = output_dir / "archive_verification.json"
+    sha256_path = output_dir / "archive_sha256.txt"
+    try:
+        verification = publish_package_set(
+            candidate=candidate,
+            archive=archive,
+            verification_path=verification_path,
+            sha256_path=sha256_path,
+            expected_files=files,
         )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "archive_verification.json").write_text(
-        json.dumps(verification, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    (output_dir / "archive_sha256.txt").write_text(
-        f"{verification['archive_sha256']}  {archive.name}\n", encoding="utf-8"
-    )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     print(json.dumps(verification, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 

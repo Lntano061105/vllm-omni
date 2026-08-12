@@ -203,6 +203,12 @@ python competition/minicpmo_b/scripts/build_final_submission.py
 python competition/minicpmo_b/scripts/validate_final_evidence.py --require-package
 ```
 
+最终归档使用隐藏候选文件构建并流式验证，成功后才原子发布；最终门禁会重新核对 tar
+内部逐文件 SHA256、metadata、成员全集与当前权威证据树，避免大 Demo 视频导致验证
+OOM，也拒绝生成后证据被修改或 sidecar 与归档不同步。`--require-package --output`
+只能写到结果树外（如 `/tmp/final_package_audit.json`），防止验证输出反过来修改已打包
+的权威证据。
+
 官方 Demo 录屏结束后，先从 `DEMO_RUN_METADATA_TEMPLATE.json` 和
 `DEMO_SCENARIO_EVIDENCE_TEMPLATE.json` 的逐请求记录生成哈希绑定的总清单：
 

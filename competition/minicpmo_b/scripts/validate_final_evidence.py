@@ -60,6 +60,14 @@ if _ORCHESTRATOR_SPEC is None or _ORCHESTRATOR_SPEC.loader is None:
 _ORCHESTRATOR = importlib.util.module_from_spec(_ORCHESTRATOR_SPEC)
 sys.modules[_ORCHESTRATOR_SPEC.name] = _ORCHESTRATOR
 _ORCHESTRATOR_SPEC.loader.exec_module(_ORCHESTRATOR)
+_FINAL_PACKAGE_SCRIPT = Path(__file__).with_name("build_final_submission.py")
+_FINAL_PACKAGE_SPEC = importlib.util.spec_from_file_location(
+    "minicpmo_b_final_package", _FINAL_PACKAGE_SCRIPT
+)
+if _FINAL_PACKAGE_SPEC is None or _FINAL_PACKAGE_SPEC.loader is None:
+    raise RuntimeError(f"cannot load final package verifier: {_FINAL_PACKAGE_SCRIPT}")
+_FINAL_PACKAGE = importlib.util.module_from_spec(_FINAL_PACKAGE_SPEC)
+_FINAL_PACKAGE_SPEC.loader.exec_module(_FINAL_PACKAGE)
 REQUIRED_ORCHESTRATOR_PHASES = (
     "preflight",
     "environment",
@@ -1092,17 +1100,46 @@ def _check_package(package_root: Path, failures: list[str]) -> None:
     verification = _passed_json(package_root / "archive_verification.json", failures)
     _nonempty(archive, failures)
     _nonempty(package_root / "archive_sha256.txt", failures)
+    recomputed: dict[str, Any] | None = None
+    if archive.is_file():
+        try:
+            authoritative_files = _FINAL_PACKAGE.collect_evidence_files(
+                package_root.parents[1], package_root
+            )
+        except ValueError as exc:
+            failures.append(f"cannot collect authoritative package evidence: {exc}")
+            authoritative_files = None
+        recomputed = _FINAL_PACKAGE.verify_archive(
+            archive, expected_files=authoritative_files
+        )
+        if recomputed.get("passed") is not True:
+            failures.append(
+                "final submission archive internal verification failed: "
+                + "; ".join(str(item) for item in recomputed.get("failures", []))
+            )
     if verification is not None:
-        actual = hashlib.sha256(archive.read_bytes()).hexdigest() if archive.is_file() else None
+        actual = _sha256_file(archive) if archive.is_file() else None
         if actual != verification.get("archive_sha256"):
             failures.append("final submission archive SHA256 does not match verification JSON")
         if not isinstance(verification.get("evidence_file_count"), int) or verification[
             "evidence_file_count"
         ] <= 0:
             failures.append("final submission archive contains no evidence files")
+        if recomputed is not None:
+            for key in (
+                "archive",
+                "passed",
+                "archive_sha256",
+                "evidence_file_count",
+                "failures",
+            ):
+                if verification.get(key) != recomputed.get(key):
+                    failures.append(
+                        f"saved archive verification {key} differs from recomputation"
+                    )
     manifest = package_root / "archive_sha256.txt"
     if manifest.is_file() and archive.is_file():
-        expected_line = f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}"
+        expected_line = f"{_sha256_file(archive)}  {archive.name}"
         if manifest.read_text(encoding="utf-8").strip() != expected_line:
             failures.append("archive_sha256.txt does not match final submission archive")
 
@@ -1243,6 +1280,17 @@ def main() -> int:
     args = parser.parse_args()
     result_root = args.result_root.expanduser().resolve()
     demo_root = (args.demo_root or result_root / "demo").expanduser().resolve()
+    if args.require_package and args.output is not None:
+        output = args.output.expanduser().resolve()
+        try:
+            output.relative_to(result_root)
+        except ValueError:
+            pass
+        else:
+            parser.error(
+                "--require-package --output must be outside result-root; writing into "
+                "the authoritative evidence tree would invalidate the verified archive"
+            )
     if args.demo_only:
         if args.require_package:
             parser.error("--demo-only cannot be combined with --require-package")

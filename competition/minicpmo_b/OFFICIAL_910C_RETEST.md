@@ -473,7 +473,17 @@ python competition/minicpmo_b/scripts/build_final_submission.py
 python competition/minicpmo_b/scripts/validate_final_evidence.py --require-package
 ```
 
+最终 `--require-package` 不要把 `--output` 写入 `results/official_910c/`；该目录本身已
+属于归档权威证据，验证后改写其中任一文件会立即使刚验证的 tar 过期。若需要保存
+最终验证输出，请使用结果树外路径，例如 `--output /tmp/final_package_audit.json`；
+工具会主动拒绝写入结果树内部。
+
 最终上传文件为
 `results/official_910c/final_submission/package/minicpmo_b_official_910c.tar.gz`，外部
 摘要保存在同目录 `archive_sha256.txt`。归档拒绝符号链接、重复/逃逸路径以及未被
-清单覆盖的文件，并固定成员顺序、mtime、UID/GID 和 gzip 时间戳以便复现。
+清单覆盖的文件，并固定成员顺序、mtime、UID/GID 和 gzip 时间戳以便复现。构建器
+先生成隐藏候选包，使用固定内存的流式 SHA256 验证全部成员、内嵌清单和 metadata，
+再与当前结果目录的权威证据文件名及内容逐一对照；全部通过后才原子替换正式 tar，
+不会因新包构建失败破坏上一份有效归档。`archive_verification.json` 与
+`archive_sha256.txt` 同样以 fsync + 原子替换发布。最终 `--require-package` 会重新打开
+tar 独立执行相同内部与权威文件集校验，不只信任已有 sidecar。

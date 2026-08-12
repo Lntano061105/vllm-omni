@@ -4,6 +4,8 @@ import hashlib
 import io
 import importlib.util
 import json
+import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -692,6 +694,90 @@ def test_require_package_rejects_missing_final_archive(tmp_path: Path) -> None:
     )
     assert result["passed"] is False
     assert any("archive_verification.json" in item for item in result["failures"])
+
+
+def _build_valid_final_package(root: Path) -> Path:
+    package = root / "final_submission/package"
+    _write_json(
+        root / "final_evidence_audit.json",
+        {"passed": True, "package_required": False, "official_910c_evidence": True},
+    )
+    files = _MOD._FINAL_PACKAGE.collect_evidence_files(root, package)
+    archive = package / "minicpmo_b_official_910c.tar.gz"
+    _MOD._FINAL_PACKAGE.write_deterministic_archive(
+        archive,
+        files,
+        metadata={
+            "format_version": 1,
+            "environment_timestamp_utc": "2026-08-12T00:00:00Z",
+            "official_910c_evidence": True,
+            "final_evidence_passed": True,
+            "evidence_file_count": len(files),
+        },
+    )
+    verification = _MOD._FINAL_PACKAGE.verify_archive(
+        archive, expected_files=files
+    )
+    assert verification["passed"] is True, verification
+    _write_json(package / "archive_verification.json", verification)
+    _write(
+        package / "archive_sha256.txt",
+        f"{verification['archive_sha256']}  {archive.name}\n",
+    )
+    return archive
+
+
+def test_require_package_recomputes_internal_manifest_and_authoritative_files(
+    tmp_path: Path,
+) -> None:
+    root, demo, source, report = _build_complete_tree(tmp_path)
+    _build_valid_final_package(root)
+    result = _MOD.audit(
+        result_root=root,
+        demo_root=demo,
+        source_root=source,
+        report=report,
+        require_package=True,
+    )
+    assert result["passed"] is True, result["failures"]
+
+    server_log = root / "official_910c_optimized/performance/server.log"
+    _write(server_log, server_log.read_text() + "changed after packaging\n")
+    result = _MOD.audit(
+        result_root=root,
+        demo_root=demo,
+        source_root=source,
+        report=report,
+        require_package=True,
+    )
+    assert result["passed"] is False
+    assert any(
+        "differs from current authoritative file" in item
+        for item in result["failures"]
+    )
+
+
+def test_require_package_refuses_output_inside_authoritative_result_tree(
+    tmp_path: Path,
+) -> None:
+    root, _, _, _ = _build_complete_tree(tmp_path)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT),
+            "--result-root",
+            str(root),
+            "--require-package",
+            "--output",
+            str(root / "final_evidence_audit.json"),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    assert completed.returncode != 0
+    assert "would invalidate the verified archive" in completed.stdout
 
 
 def test_render_final_report_uses_official_speak_metric(tmp_path: Path) -> None:
