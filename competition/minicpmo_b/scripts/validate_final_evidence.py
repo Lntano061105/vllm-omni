@@ -9,7 +9,9 @@ import importlib.util
 import json
 import re
 import sys
+import tarfile
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 
@@ -180,6 +182,67 @@ def _verify_local_sha256_manifest(path: Path, failures: list[str]) -> None:
         actual = hashlib.sha256(target.read_bytes()).hexdigest()
         if actual != expected:
             failures.append(f"SHA256 mismatch: {target}")
+
+
+def _verify_source_snapshot(
+    archive: Path, manifest_path: Path, failures: list[str]
+) -> None:
+    """Verify every regular file in the Git archive against source_sha256."""
+    if not archive.is_file() or not manifest_path.is_file():
+        return
+    expected: dict[str, str] = {}
+    for line_number, line in enumerate(
+        manifest_path.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        if not line.strip():
+            continue
+        try:
+            digest, raw_name = line.split(None, 1)
+        except ValueError:
+            failures.append(
+                f"invalid source SHA256 manifest line {manifest_path}:{line_number}"
+            )
+            continue
+        name = raw_name.strip()
+        if name in expected:
+            failures.append(f"duplicate source SHA256 manifest entry: {name}")
+        expected[name] = digest
+    observed: set[str] = set()
+    try:
+        with tarfile.open(archive, mode="r:gz") as tar:
+            for member in tar.getmembers():
+                pure = PurePosixPath(member.name)
+                if pure.is_absolute() or ".." in pure.parts:
+                    failures.append(f"unsafe source snapshot path: {member.name}")
+                    continue
+                if not member.isfile():
+                    if not member.isdir():
+                        failures.append(
+                            f"non-regular source snapshot member: {member.name}"
+                        )
+                    continue
+                if member.name in observed:
+                    failures.append(f"duplicate source snapshot member: {member.name}")
+                    continue
+                observed.add(member.name)
+                extracted = tar.extractfile(member)
+                if extracted is None:
+                    failures.append(f"cannot read source snapshot member: {member.name}")
+                    continue
+                digest = hashlib.sha256(extracted.read()).hexdigest()
+                if expected.get(member.name) != digest:
+                    failures.append(
+                        "source snapshot SHA256 mismatch or unmanifested member: "
+                        + member.name
+                    )
+    except (OSError, tarfile.TarError) as exc:
+        failures.append(f"cannot read source snapshot {archive}: {exc}")
+        return
+    missing = sorted(set(expected) - observed)
+    if missing:
+        failures.append(
+            "source snapshot is missing manifest entries: " + ", ".join(missing[:20])
+        )
 
 
 def _check_environment(root: Path, failures: list[str]) -> None:
@@ -606,6 +669,9 @@ def _check_source(source_root: Path, failures: list[str]) -> None:
         "optimization.patch",
         "git_commit.txt",
         "git_base_commit.txt",
+        "git_branch.txt",
+        "git_tree.txt",
+        "changed_files.txt",
         "source_sha256.txt",
         "artifact_metadata.json",
         "artifact_sha256.txt",
@@ -617,10 +683,45 @@ def _check_source(source_root: Path, failures: list[str]) -> None:
     if metadata is not None:
         if metadata.get("final_candidate") is not True or metadata.get("dirty_worktree") is not False:
             failures.append("source artifact metadata is not a clean final candidate")
+        for key, filename in (
+            ("head_commit", "git_commit.txt"),
+            ("base_commit", "git_base_commit.txt"),
+            ("branch", "git_branch.txt"),
+        ):
+            path = source_root / filename
+            if path.is_file() and metadata.get(key) != path.read_text(
+                encoding="utf-8"
+            ).strip():
+                failures.append(f"source metadata {key} does not match {filename}")
+        manifest_path = source_root / "source_sha256.txt"
+        if manifest_path.is_file():
+            manifest_count = sum(
+                1
+                for line in manifest_path.read_text(encoding="utf-8").splitlines()
+                if line
+            )
+            if metadata.get("source_manifest_file_count") != manifest_count:
+                failures.append(
+                    "source metadata manifest count does not match source_sha256.txt"
+                )
     audit = _passed_json(source_root / "submission_package_audit.json", failures)
     if audit is not None and audit.get("warnings"):
         failures.append("source submission package audit contains warnings")
     _verify_local_sha256_manifest(source_root / "artifact_sha256.txt", failures)
+    _verify_source_snapshot(
+        source_root / "source_snapshot.tar.gz",
+        source_root / "source_sha256.txt",
+        failures,
+    )
+    environment_commit = source_root.parents[1] / "environment/git_commit.txt"
+    source_commit = source_root / "git_commit.txt"
+    if environment_commit.is_file() and source_commit.is_file():
+        if environment_commit.read_text(encoding="utf-8").strip() != source_commit.read_text(
+            encoding="utf-8"
+        ).strip():
+            failures.append(
+                "official environment git commit does not match source artifact commit"
+            )
 
 
 def _check_package(package_root: Path, failures: list[str]) -> None:

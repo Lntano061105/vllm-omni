@@ -22,7 +22,7 @@
 | 最终报告与复现包 | 未完成 | 填满 `REPORT.md` 的 910C 表格，附代码 SHA、patch、YAML、脚本、日志、视频和 SHA256 |
 | 提交包静态审计 | 通过 | 先运行 `python competition/minicpmo_b/scripts/validate_submission_package.py --output /tmp/minicpmo_submission_source_plan.json` 审阅 `planned_source_files`，再运行同脚本的 `--require-tracked` 门禁；所有 `competition/minicpmo_b/` 源码/配置（排除 `results/`）与 `tests/competition/` 新文件均纳入计划，同时拒绝跟踪 `results/`、`extra-info/`、`kernel_meta/`、缺失的 YAML 继承目标或超过 10 MiB 的源文件。根目录 Ascend `extra-info/` 与 `kernel_meta/` 缓存已忽略，不会把源码制品误判为脏工作树 |
 | 官方复测编排 | 静态实现通过，待 910C 执行 | `run_official_910c_retest.py` dry-run-first、显式二次确认、命令哈希断点续跑；执行前冻结 `orchestrator_plan.json`，最终审计从当前代码重建并核对全部 26 阶段规范命令；含单 910C preflight、A/B 矩阵、c1/c4/c8 门禁和三项精度比较 |
-| 可复现源码制品 | 未生成 | 工作树干净且全部证据完成后，以 `origin/minicpm-challenge` 为 base 运行 `build_submission_artifacts.py`，提交 archive、binary patch、Git SHA/tree 和覆盖整个 HEAD（含 benchmark/E2E 支撑测试）的 SHA256 清单 |
+| 可复现源码制品 | 开发态生成与 clean-clone 验证通过，官方证据包待生成 | 工作树干净且全部证据完成后，以 `origin/minicpm-challenge` 为 base 运行 `build_submission_artifacts.py`，提交 archive、binary patch、Git SHA/tree 和覆盖整个 HEAD（含 benchmark/E2E 支撑测试）的 SHA256 清单；最终审计会打开归档逐文件核对清单，并绑定环境冻结 commit 与源码制品 commit |
 | 最终全证据门禁 | 未通过（当前应失败） | `validate_final_evidence.py` 必须最终得到 `passed=true`；直接核验 910C 环境、原始性能/精度、多轮、Demo 四场景、报告与源码 SHA256，当前缺失证据不得被 910B4 开发结果替代 |
 | 最终确定性归档 | 未生成 | 全证据通过后运行 `build_final_submission.py`，再用 `validate_final_evidence.py --require-package` 验证归档 SHA256、成员清单与完整性 |
 

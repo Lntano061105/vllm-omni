@@ -394,7 +394,10 @@ python competition/minicpmo_b/scripts/validate_final_evidence.py \
 
 该门禁直接检查单卡 910C preflight、模型/数据/评测权重 hash、基线与优化版
 c1/c4/c8 原始结果和服务日志、SPEAK RTF gate、多轮原始 JSON、三项完整精度与 2pp
-gate、26 个阶段的命令/哈希/退出状态、Demo 四场景/视频/日志、干净源码制品及其 SHA256。只有审计结果
+gate、26 个阶段的命令/哈希/退出状态、Demo 四场景/视频/日志、干净源码制品及其 SHA256。
+源码审计还会打开 `source_snapshot.tar.gz`，逐文件与覆盖完整 HEAD 的
+`source_sha256.txt` 核对，并要求环境冻结时的 Git commit 与源码制品 commit 完全一致；
+仅修改外层 `artifact_sha256.txt` 不能掩盖归档成员被替换或遗漏。只有审计结果
 `passed=true` 才能声明提交包完成。
 
 审计通过后构建确定性最终归档，并再次验证归档内部的逐文件 SHA256：

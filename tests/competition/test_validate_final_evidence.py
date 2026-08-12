@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import importlib.util
 import json
+import tarfile
 from pathlib import Path
 
 
@@ -355,25 +357,59 @@ def _build_complete_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     )
 
     source = root / "final_submission/source"
+    source_members = {
+        "competition/minicpmo_b/README.md": b"submission source\n",
+        "vllm_omni/config/stage_config.py": b"source code\n",
+    }
+    source_archive = source / "source_snapshot.tar.gz"
+    source_archive.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(source_archive, "w:gz") as tar:
+        for name, data in sorted(source_members.items()):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    source_manifest = "".join(
+        f"{hashlib.sha256(data).hexdigest()}  {name}\n"
+        for name, data in sorted(source_members.items())
+    )
     files = (
-        "source_snapshot.tar.gz",
         "optimization.patch",
         "git_commit.txt",
         "git_base_commit.txt",
-        "source_sha256.txt",
+        "git_branch.txt",
+        "git_tree.txt",
+        "changed_files.txt",
     )
     for name in files:
         _write(source / name)
+    _write(source / "source_sha256.txt", source_manifest)
+    _write(source / "git_commit.txt", (env / "git_commit.txt").read_text())
+    _write(source / "git_base_commit.txt", "base-commit\n")
+    _write(source / "git_branch.txt", "minicpm-challenge-optimized\n")
     _write(source / "git_status.txt", "")
     _write_json(
         source / "artifact_metadata.json",
-        {"final_candidate": True, "dirty_worktree": False},
+        {
+            "final_candidate": True,
+            "dirty_worktree": False,
+            "head_commit": (source / "git_commit.txt").read_text().strip(),
+            "base_commit": "base-commit",
+            "branch": "minicpm-challenge-optimized",
+            "source_manifest_file_count": len(source_members),
+        },
     )
     _write_json(
         source / "submission_package_audit.json",
         {"passed": True, "warnings": []},
     )
-    hashed_names = (*files, "git_status.txt", "artifact_metadata.json", "submission_package_audit.json")
+    hashed_names = (
+        "source_snapshot.tar.gz",
+        *files,
+        "source_sha256.txt",
+        "git_status.txt",
+        "artifact_metadata.json",
+        "submission_package_audit.json",
+    )
     manifest = "".join(
         f"{hashlib.sha256((source / name).read_bytes()).hexdigest()}  {name}\n"
         for name in hashed_names
@@ -424,6 +460,54 @@ def test_rejects_report_placeholder_and_bad_artifact_hash(tmp_path: Path) -> Non
     assert result["passed"] is False
     assert any("待填写" in item for item in result["failures"])
     assert any("SHA256 mismatch" in item for item in result["failures"])
+
+
+def _refresh_artifact_manifest(source: Path) -> None:
+    names = [
+        path.name
+        for path in source.iterdir()
+        if path.is_file() and path.name != "artifact_sha256.txt"
+    ]
+    payload = "".join(
+        f"{hashlib.sha256((source / name).read_bytes()).hexdigest()}  {name}\n"
+        for name in sorted(names)
+    )
+    _write(source / "artifact_sha256.txt", payload)
+
+
+def test_rejects_replaced_source_archive_even_with_refreshed_outer_hash(
+    tmp_path: Path,
+) -> None:
+    root, demo, source, report = _build_complete_tree(tmp_path)
+    with tarfile.open(source / "source_snapshot.tar.gz", "w:gz") as tar:
+        data = b"different source\n"
+        info = tarfile.TarInfo("competition/minicpmo_b/README.md")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    _refresh_artifact_manifest(source)
+
+    result = _MOD.audit(result_root=root, demo_root=demo, source_root=source, report=report)
+    assert result["passed"] is False
+    assert any("source snapshot SHA256 mismatch" in item for item in result["failures"])
+    assert any("source snapshot is missing manifest entries" in item for item in result["failures"])
+
+
+def test_rejects_source_commit_different_from_official_environment(
+    tmp_path: Path,
+) -> None:
+    root, demo, source, report = _build_complete_tree(tmp_path)
+    _write(source / "git_commit.txt", "different-commit\n")
+    metadata = json.loads((source / "artifact_metadata.json").read_text())
+    metadata["head_commit"] = "different-commit"
+    _write_json(source / "artifact_metadata.json", metadata)
+    _refresh_artifact_manifest(source)
+
+    result = _MOD.audit(result_root=root, demo_root=demo, source_root=source, report=report)
+    assert result["passed"] is False
+    assert any(
+        "official environment git commit does not match source artifact commit" in item
+        for item in result["failures"]
+    )
 
 
 def test_rejects_self_consistent_but_noncanonical_orchestrator_command(
