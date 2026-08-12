@@ -23,8 +23,16 @@ python competition/minicpmo_b/scripts/run_official_910c_retest.py \
   --execute --confirm-single-910c
 ```
 
+正式执行前必须先提交全部代码和配置，使
+`git status --porcelain --untracked-files=all` 为空。编排器把 HEAD commit/tree
+写入冻结计划和每个阶段 marker；未提交改动会被拒绝，避免官方成绩来自无法进入
+源码制品的代码。
+
 编排器按阶段写入 `orchestrator_state/*.json`，命令哈希不变且已通过的阶段会自动
-跳过；可用重复的 `--phase NAME` 仅执行指定阶段。它包含 910C/单可见卡/残留服务
+跳过；可用重复的 `--phase NAME` 仅执行指定阶段。冻结计划一旦存在，同一
+`--result-root` 只能用完全相同的输入、镜像 digest、Git commit 和 Git tree 恢复；
+任何漂移都会立即停止，必须使用新的结果目录，禁止把不同轮次证据混在一起。它包含
+910C/单可见卡/残留服务
 preflight、模型全部 checkpoint 分片、Token2Wav ONNX/PT 资产、三套完整数据、
 Whisper/WavLM/UTMOS、依赖版本、端口、磁盘空间与 S3Tokenizer/campplus CPU 加载探针，
 以及环境冻结、基线/优化 c1/c4/c8、双工 RTF、多轮门禁、三项精度、性能
@@ -34,6 +42,13 @@ Whisper/WavLM/UTMOS、依赖版本、端口、磁盘空间与 S3Tokenizer/camppl
 26 阶段顺序、规范命令及 SHA256。最终证据审计会用当前提交中的
 `build_phases()` 重新生成计划，并逐项核对计划与每个阶段 marker；即使有人同步修改
 marker 中的命令与哈希，只要命令偏离规范计划也会失败。
+
+使用 `--rerun-completed`，或恢复一个尚未通过/旧格式的阶段时，编排器会把该阶段及
+其全部下游 marker 移入 `orchestrator_state/history/<UTC>/`，并保存
+`invalidation.json`，随后只认可当前冻结计划重新生成的 marker。默认不删除历史
+长测证据。若同时使用 `--phase NAME` 做局部重跑，必须继续重跑该阶段之后的全部下游
+阶段（最稳妥是去掉 `--phase` 再恢复完整编排）；否则最终审计会因下游 marker 缺失
+而失败。每个 marker 还绑定计划 SHA256、源码 commit/tree 和合法 UTC 起止时间。
 
 总编排共 26 个阶段。性能矩阵、Realtime 双工和三项精度各自生成
 `run_protocol.json`；基线与优化版必须具有完全相同的输入参数、请求顺序、warmup、

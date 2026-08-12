@@ -74,6 +74,9 @@ def _build_complete_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         "quay.io/ascend/vllm-omni@sha256:" + "a" * 64 + "\n",
     )
     _write(env / "cann_version.txt", "Version=9.1.0\n")
+    frozen_commit = "a" * 40
+    frozen_tree = "b" * 40
+    _write(env / "git_commit.txt", frozen_commit + "\n")
     _write(env / "git_status.txt", "")
     orchestrator_inputs = {
         "result_root": str(root),
@@ -94,12 +97,16 @@ def _build_complete_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         port=8091,
         image_digest=orchestrator_inputs["image_digest"],
     )
+    orchestrator_plan = _MOD._ORCHESTRATOR.build_plan(
+        orchestrator_phases,
+        inputs=orchestrator_inputs,
+        source={"git_commit": frozen_commit, "git_tree": frozen_tree},
+    )
     _write_json(
         root / "orchestrator_state/orchestrator_plan.json",
-        _MOD._ORCHESTRATOR.build_plan(
-            orchestrator_phases, inputs=orchestrator_inputs
-        ),
+        orchestrator_plan,
     )
+    plan_sha256 = _MOD._ORCHESTRATOR._plan_sha256(orchestrator_plan)
     for phase in orchestrator_phases:
         command = _MOD._ORCHESTRATOR._render(phase)
         _write_json(
@@ -108,6 +115,10 @@ def _build_complete_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
                 "phase": phase.name,
                 "command": command,
                 "command_sha256": hashlib.sha256(command.encode()).hexdigest(),
+                "plan_sha256": plan_sha256,
+                "source": orchestrator_plan["source"],
+                "started_utc": "2026-08-12T00:00:00Z",
+                "finished_utc": "2026-08-12T00:00:01Z",
                 "returncode": 0,
                 "passed": True,
             },
@@ -433,6 +444,7 @@ def _build_complete_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         _write(source / name)
     _write(source / "source_sha256.txt", source_manifest)
     _write(source / "git_commit.txt", (env / "git_commit.txt").read_text())
+    _write(source / "git_tree.txt", frozen_tree + "\n")
     _write(source / "git_base_commit.txt", "base-commit\n")
     _write(source / "git_branch.txt", "minicpm-challenge-optimized\n")
     _write(source / "git_status.txt", "")
@@ -650,6 +662,23 @@ def test_rejects_tampered_orchestrator_plan_even_when_markers_are_unchanged(
         "orchestrator_plan.json differs from current canonical" in item
         for item in result["failures"]
     )
+
+
+def test_rejects_orchestrator_source_tree_and_marker_timestamp_tampering(
+    tmp_path: Path,
+) -> None:
+    root, demo, source, report = _build_complete_tree(tmp_path)
+    _write(source / "git_tree.txt", "c" * 40 + "\n")
+    marker_path = root / "orchestrator_state/performance-optimized.json"
+    marker = json.loads(marker_path.read_text())
+    marker["started_utc"] = "2026-08-12T00:00:02Z"
+    marker["finished_utc"] = "2026-08-12T00:00:01Z"
+    _write_json(marker_path, marker)
+
+    result = _MOD.audit(result_root=root, demo_root=demo, source_root=source, report=report)
+    assert result["passed"] is False
+    assert any("plan tree differs" in item for item in result["failures"])
+    assert any("marker finished before start" in item for item in result["failures"])
 
 
 def test_require_package_rejects_missing_final_archive(tmp_path: Path) -> None:

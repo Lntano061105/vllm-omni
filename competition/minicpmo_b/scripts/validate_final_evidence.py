@@ -321,6 +321,43 @@ def _check_orchestrator(root: Path, failures: list[str]) -> None:
     plan = _json(state / "orchestrator_plan.json", failures)
     expected_commands: dict[str, str] = {}
     if plan is not None:
+        if plan.get("format_version") != 2:
+            failures.append("orchestrator plan format_version is not 2")
+        source = plan.get("source")
+        if not isinstance(source, dict):
+            failures.append("orchestrator plan source identity is missing")
+            source = {}
+        git_commit = source.get("git_commit")
+        git_tree = source.get("git_tree")
+        if not isinstance(git_commit, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{40,64}", git_commit
+        ):
+            failures.append("orchestrator plan git_commit is invalid")
+        if not isinstance(git_tree, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{40,64}", git_tree
+        ):
+            failures.append("orchestrator plan git_tree is invalid")
+        env_commit_path = root / "environment/git_commit.txt"
+        if env_commit_path.is_file() and isinstance(git_commit, str):
+            env_commit = env_commit_path.read_text(encoding="utf-8").strip()
+            if env_commit != git_commit:
+                failures.append(
+                    "orchestrator plan commit differs from environment git_commit.txt"
+                )
+        source_commit_path = root / "final_submission/source/git_commit.txt"
+        if source_commit_path.is_file() and isinstance(git_commit, str):
+            source_commit = source_commit_path.read_text(encoding="utf-8").strip()
+            if source_commit != git_commit:
+                failures.append(
+                    "orchestrator plan commit differs from source artifact git_commit.txt"
+                )
+        source_tree_path = root / "final_submission/source/git_tree.txt"
+        if source_tree_path.is_file() and isinstance(git_tree, str):
+            source_tree = source_tree_path.read_text(encoding="utf-8").strip()
+            if source_tree != git_tree:
+                failures.append(
+                    "orchestrator plan tree differs from source artifact git_tree.txt"
+                )
         inputs = plan.get("inputs")
         try:
             if not isinstance(inputs, dict):
@@ -344,10 +381,15 @@ def _check_orchestrator(root: Path, failures: list[str]) -> None:
         rebuilt_names = [phase.name for phase in rebuilt]
         if rebuilt_names != list(REQUIRED_ORCHESTRATOR_PHASES):
             failures.append("orchestrator rebuilt phase order/count differs from required 26 phases")
-        expected_plan = _ORCHESTRATOR.build_plan(rebuilt, inputs=inputs) if rebuilt else None
+        expected_plan = (
+            _ORCHESTRATOR.build_plan(rebuilt, inputs=inputs, source=source)
+            if rebuilt
+            else None
+        )
         if expected_plan is not None and plan != expected_plan:
             failures.append("orchestrator_plan.json differs from current canonical build_phases output")
         expected_commands = {phase.name: _ORCHESTRATOR._render(phase) for phase in rebuilt}
+    plan_hash = _ORCHESTRATOR._plan_sha256(plan) if plan is not None else None
     for phase in REQUIRED_ORCHESTRATOR_PHASES:
         marker = _json(state / f"{phase}.json", failures)
         if marker is None:
@@ -364,6 +406,16 @@ def _check_orchestrator(root: Path, failures: list[str]) -> None:
             failures.append(f"orchestrator command hash mismatch: {phase}")
         elif expected_commands and command != expected_commands.get(phase):
             failures.append(f"orchestrator marker command differs from canonical plan: {phase}")
+        if plan_hash is not None and marker.get("plan_sha256") != plan_hash:
+            failures.append(f"orchestrator marker plan hash mismatch: {phase}")
+        if plan is not None and marker.get("source") != plan.get("source"):
+            failures.append(f"orchestrator marker source identity mismatch: {phase}")
+        started = _timezone_aware_datetime(marker.get("started_utc"))
+        finished = _timezone_aware_datetime(marker.get("finished_utc"))
+        if started is None or finished is None:
+            failures.append(f"orchestrator marker timestamps are invalid: {phase}")
+        elif finished <= started:
+            failures.append(f"orchestrator marker finished before start: {phase}")
 
 
 def _check_performance(root: Path, failures: list[str]) -> None:

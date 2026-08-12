@@ -27,6 +27,39 @@ class Phase:
     env: dict[str, str]
 
 
+def _git_value(*args: str) -> str:
+    completed = subprocess.run(
+        ("git", *args),
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed: {completed.stderr.strip()}"
+        )
+    return completed.stdout.strip()
+
+
+def source_identity() -> dict[str, str]:
+    return {
+        "git_commit": _git_value("rev-parse", "HEAD"),
+        "git_tree": _git_value("rev-parse", "HEAD^{tree}"),
+    }
+
+
+def require_clean_source() -> None:
+    status = _git_value("status", "--porcelain", "--untracked-files=all")
+    if status:
+        preview = "\n".join(status.splitlines()[:20])
+        raise RuntimeError(
+            "official execution requires a clean Git worktree; commit or remove "
+            f"all changes first:\n{preview}"
+        )
+
+
 def _phase(
     name: str,
     script: str,
@@ -353,13 +386,19 @@ def _render(phase: Phase) -> str:
     return f"{env} {argv}".strip()
 
 
-def build_plan(phases: list[Phase], *, inputs: dict[str, object]) -> dict[str, object]:
+def build_plan(
+    phases: list[Phase],
+    *,
+    inputs: dict[str, object],
+    source: dict[str, str] | None = None,
+) -> dict[str, object]:
     """Freeze the canonical phase order and commands for later re-audit."""
     return {
-        "format_version": 1,
+        "format_version": 2,
         "phase_count": len(phases),
         "phase_names": [phase.name for phase in phases],
         "inputs": inputs,
+        "source": source or source_identity(),
         "phases": [
             {
                 "name": phase.name,
@@ -369,6 +408,128 @@ def build_plan(phases: list[Phase], *, inputs: dict[str, object]) -> dict[str, o
             for phase in phases
         ],
     }
+
+
+def _plan_sha256(plan: dict[str, object]) -> str:
+    canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _load_json_object(path: Path) -> dict[str, object]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read orchestrator state {path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"orchestrator state is not a JSON object: {path}")
+    return value
+
+
+def _freeze_or_validate_plan(path: Path, plan: dict[str, object]) -> None:
+    if path.is_file():
+        frozen = _load_json_object(path)
+        if frozen != plan:
+            raise RuntimeError(
+                "existing orchestrator plan differs from current inputs/source; "
+                "use a new --result-root instead of mixing official evidence"
+            )
+        return
+    _atomic_json(path, plan)
+
+
+def _marker_passes(marker: Path, command_hash: str, plan_hash: str) -> bool:
+    if not marker.is_file():
+        return False
+    old = _load_json_object(marker)
+    return (
+        old.get("passed") is True
+        and old.get("returncode") == 0
+        and old.get("command_sha256") == command_hash
+        and old.get("plan_sha256") == plan_hash
+    )
+
+
+def _archive_invalidated_markers(
+    state_dir: Path,
+    all_phases: list[Phase],
+    *,
+    first_rerun_index: int,
+) -> list[str]:
+    invalidated = [
+        state_dir / f"{phase.name}.json"
+        for phase in all_phases[first_rerun_index:]
+        if (state_dir / f"{phase.name}.json").is_file()
+    ]
+    if not invalidated:
+        return []
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    archive = state_dir / "history" / stamp
+    archive.mkdir(parents=True, exist_ok=False)
+    archived: list[str] = []
+    for marker in invalidated:
+        target = archive / marker.name
+        os.replace(marker, target)
+        archived.append(marker.stem)
+    _atomic_json(
+        archive / "invalidation.json",
+        {
+            "invalidated_from_phase": all_phases[first_rerun_index].name,
+            "invalidated_utc": datetime.now(timezone.utc).isoformat(),
+            "archived_markers": archived,
+        },
+    )
+    return archived
+
+
+def _missing_prerequisites(
+    *,
+    selected: list[Phase],
+    all_phases: list[Phase],
+    state_dir: Path,
+    plan_hash: str,
+) -> dict[str, list[str]]:
+    indexes = {phase.name: index for index, phase in enumerate(all_phases)}
+    selected_names = {phase.name for phase in selected}
+    missing: dict[str, list[str]] = {}
+    for phase in selected:
+        required: list[str] = []
+        for prerequisite in all_phases[: indexes[phase.name]]:
+            if prerequisite.name in selected_names:
+                continue
+            command_hash = hashlib.sha256(
+                _render(prerequisite).encode()
+            ).hexdigest()
+            if not _marker_passes(
+                state_dir / f"{prerequisite.name}.json",
+                command_hash,
+                plan_hash,
+            ):
+                required.append(prerequisite.name)
+        if required:
+            missing[phase.name] = required
+    return missing
+
+
+def _selection_gaps_after_invalidation(
+    *,
+    selected: list[Phase],
+    all_phases: list[Phase],
+    first_execution_index: int,
+) -> list[str]:
+    selected_names = {phase.name for phase in selected}
+    selected_indexes = [
+        index
+        for index, phase in enumerate(all_phases)
+        if phase.name in selected_names and index >= first_execution_index
+    ]
+    if not selected_indexes:
+        return []
+    last_selected = max(selected_indexes)
+    return [
+        phase.name
+        for phase in all_phases[first_execution_index : last_selected + 1]
+        if phase.name not in selected_names
+    ]
 
 
 def _atomic_json(path: Path, payload: dict[str, object]) -> None:
@@ -451,16 +612,76 @@ def main() -> int:
     if not args.image_digest:
         parser.error("--execute requires --image-digest or CONTAINER_IMAGE_DIGEST")
 
+    try:
+        require_clean_source()
+        plan = build_plan(all_phases, inputs=inputs)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
     state_dir = result_root / "orchestrator_state"
     state_dir.mkdir(parents=True, exist_ok=True)
-    _atomic_json(state_dir / "orchestrator_plan.json", build_plan(all_phases, inputs=inputs))
+    plan_path = state_dir / "orchestrator_plan.json"
+    try:
+        _freeze_or_validate_plan(plan_path, plan)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    plan_hash = _plan_sha256(plan)
+
+    missing_prerequisites = _missing_prerequisites(
+        selected=phases,
+        all_phases=all_phases,
+        state_dir=state_dir,
+        plan_hash=plan_hash,
+    )
+    if missing_prerequisites:
+        details = "; ".join(
+            f"{phase}: {', '.join(required)}"
+            for phase, required in missing_prerequisites.items()
+        )
+        raise SystemExit(
+            "selected phase(s) have incomplete prerequisites; include them in this "
+            f"run or resume the full plan: {details}"
+        )
+
+    phase_indexes = {phase.name: index for index, phase in enumerate(all_phases)}
+    execution_indexes = [
+        phase_indexes[phase.name]
+        for phase in phases
+        if args.rerun_completed
+        or not _marker_passes(
+            state_dir / f"{phase.name}.json",
+            hashlib.sha256(_render(phase).encode()).hexdigest(),
+            plan_hash,
+        )
+    ]
+    if execution_indexes:
+        first_rerun_index = min(execution_indexes)
+        gaps = _selection_gaps_after_invalidation(
+            selected=phases,
+            all_phases=all_phases,
+            first_execution_index=first_rerun_index,
+        )
+        if gaps:
+            raise SystemExit(
+                "selected phases cross dependencies that will be invalidated; "
+                "include every intermediate phase or rerun only the earliest phase: "
+                + ", ".join(gaps)
+            )
+        archived = _archive_invalidated_markers(
+            state_dir,
+            all_phases,
+            first_rerun_index=first_rerun_index,
+        )
+        if archived:
+            print(
+                "Archived invalidated markers from "
+                f"{all_phases[first_rerun_index].name}: {', '.join(archived)}"
+            )
     for phase in phases:
         command = _render(phase)
         command_hash = hashlib.sha256(command.encode()).hexdigest()
         marker = state_dir / f"{phase.name}.json"
         if marker.is_file() and not args.rerun_completed:
-            old = json.loads(marker.read_text(encoding="utf-8"))
-            if old.get("passed") is True and old.get("command_sha256") == command_hash:
+            if _marker_passes(marker, command_hash, plan_hash):
                 print(f"Skipping completed phase: {phase.name}")
                 continue
         started = datetime.now(timezone.utc).isoformat()
@@ -474,6 +695,8 @@ def main() -> int:
             "phase": phase.name,
             "command": command,
             "command_sha256": command_hash,
+            "plan_sha256": plan_hash,
+            "source": plan["source"],
             "started_utc": started,
             "finished_utc": datetime.now(timezone.utc).isoformat(),
             "returncode": completed.returncode,

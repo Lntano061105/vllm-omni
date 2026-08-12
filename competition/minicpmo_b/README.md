@@ -190,6 +190,10 @@ python competition/minicpmo_b/scripts/run_official_910c_retest.py
 c1/c4/c8 双工性能门禁和三项精度相对门禁。详细参数、断点续跑和人工 Demo 步骤见
 `competition/minicpmo_b/OFFICIAL_910C_RETEST.md`。
 
+正式编排只接受干净工作树，并把结果目录绑定到不可变输入、镜像 digest、Git
+commit/tree 和 26 阶段命令哈希。重跑上游阶段会保留历史，同时使该阶段及全部下游
+marker 失效，防止新原始结果与旧 gate 混用。
+
 正式交付前还需填写 `DEMO_EVIDENCE_TEMPLATE.json` 并运行：
 
 ```bash

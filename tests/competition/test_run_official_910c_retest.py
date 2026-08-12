@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 
 _SCRIPT = (
@@ -87,11 +91,14 @@ def test_render_is_stable() -> None:
 def test_plan_freezes_phase_order_commands_and_hashes(tmp_path: Path) -> None:
     phases = _MOD.build_phases(result_root=tmp_path, device=0, port=8091)
     inputs = {"result_root": str(tmp_path), "device": 0, "port": 8091}
-    plan = _MOD.build_plan(phases, inputs=inputs)
+    source = {"git_commit": "a" * 40, "git_tree": "b" * 40}
+    plan = _MOD.build_plan(phases, inputs=inputs, source=source)
 
+    assert plan["format_version"] == 2
     assert plan["phase_count"] == 26
     assert plan["phase_names"] == [phase.name for phase in phases]
     assert plan["inputs"] == inputs
+    assert plan["source"] == source
     for phase, frozen in zip(phases, plan["phases"], strict=True):
         command = _MOD._render(phase)
         assert frozen["name"] == phase.name
@@ -99,6 +106,145 @@ def test_plan_freezes_phase_order_commands_and_hashes(tmp_path: Path) -> None:
         assert frozen["command_sha256"] == __import__("hashlib").sha256(
             command.encode()
         ).hexdigest()
+    assert _MOD._plan_sha256(plan) == hashlib.sha256(
+        json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _passed_marker(path: Path, phase: _MOD.Phase, plan: dict[str, object]) -> None:
+    command = _MOD._render(phase)
+    path.write_text(
+        json.dumps(
+            {
+                "phase": phase.name,
+                "command": command,
+                "command_sha256": hashlib.sha256(command.encode()).hexdigest(),
+                "plan_sha256": _MOD._plan_sha256(plan),
+                "source": plan["source"],
+                "started_utc": "2026-08-12T00:00:00Z",
+                "finished_utc": "2026-08-12T00:00:01Z",
+                "returncode": 0,
+                "passed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_marker_resume_is_bound_to_plan_and_archives_rerun_downstream(
+    tmp_path: Path,
+) -> None:
+    phases = [
+        _MOD.Phase("first", ("true",), {}),
+        _MOD.Phase("second", ("true", "2"), {}),
+        _MOD.Phase("third", ("true", "3"), {}),
+    ]
+    plan = _MOD.build_plan(
+        phases,
+        inputs={"result_root": str(tmp_path)},
+        source={"git_commit": "a" * 40, "git_tree": "b" * 40},
+    )
+    state = tmp_path / "orchestrator_state"
+    state.mkdir()
+    for phase in phases:
+        _passed_marker(state / f"{phase.name}.json", phase, plan)
+    second_hash = hashlib.sha256(_MOD._render(phases[1]).encode()).hexdigest()
+    assert _MOD._marker_passes(
+        state / "second.json", second_hash, _MOD._plan_sha256(plan)
+    )
+    assert not _MOD._marker_passes(
+        state / "second.json", second_hash, "0" * 64
+    )
+
+    archived = _MOD._archive_invalidated_markers(
+        state, phases, first_rerun_index=1
+    )
+    assert archived == ["second", "third"]
+    assert (state / "first.json").is_file()
+    assert not (state / "second.json").exists()
+    histories = list((state / "history").iterdir())
+    assert len(histories) == 1
+    assert (histories[0] / "second.json").is_file()
+    assert (histories[0] / "third.json").is_file()
+    invalidation = json.loads((histories[0] / "invalidation.json").read_text())
+    assert invalidation["invalidated_from_phase"] == "second"
+
+
+def test_existing_plan_drift_is_detectable_without_overwrite(tmp_path: Path) -> None:
+    phases = [_MOD.Phase("x", ("true",), {})]
+    source = {"git_commit": "a" * 40, "git_tree": "b" * 40}
+    frozen = _MOD.build_plan(phases, inputs={"port": 8091}, source=source)
+    changed = _MOD.build_plan(phases, inputs={"port": 8092}, source=source)
+    path = tmp_path / "orchestrator_plan.json"
+    _MOD._freeze_or_validate_plan(path, frozen)
+    before = path.read_bytes()
+    _MOD._freeze_or_validate_plan(path, frozen)
+    with pytest.raises(RuntimeError, match="use a new --result-root"):
+        _MOD._freeze_or_validate_plan(path, changed)
+    assert path.read_bytes() == before
+
+
+def test_selected_downstream_phase_requires_bound_predecessor_markers(
+    tmp_path: Path,
+) -> None:
+    phases = [
+        _MOD.Phase("preflight", ("true",), {}),
+        _MOD.Phase("environment", ("true", "env"), {}),
+        _MOD.Phase("performance", ("true", "perf"), {}),
+    ]
+    plan = _MOD.build_plan(
+        phases,
+        inputs={"result_root": str(tmp_path)},
+        source={"git_commit": "a" * 40, "git_tree": "b" * 40},
+    )
+    state = tmp_path / "orchestrator_state"
+    state.mkdir()
+    missing = _MOD._missing_prerequisites(
+        selected=[phases[2]],
+        all_phases=phases,
+        state_dir=state,
+        plan_hash=_MOD._plan_sha256(plan),
+    )
+    assert missing == {"performance": ["preflight", "environment"]}
+
+    _passed_marker(state / "preflight.json", phases[0], plan)
+    _passed_marker(state / "environment.json", phases[1], plan)
+    assert _MOD._missing_prerequisites(
+        selected=[phases[2]],
+        all_phases=phases,
+        state_dir=state,
+        plan_hash=_MOD._plan_sha256(plan),
+    ) == {}
+    assert _MOD._missing_prerequisites(
+        selected=phases,
+        all_phases=phases,
+        state_dir=tmp_path / "empty-state",
+        plan_hash=_MOD._plan_sha256(plan),
+    ) == {}
+
+
+def test_selection_cannot_cross_dependencies_invalidated_by_earlier_rerun() -> None:
+    phases = [
+        _MOD.Phase("first", ("true",), {}),
+        _MOD.Phase("second", ("true", "2"), {}),
+        _MOD.Phase("third", ("true", "3"), {}),
+        _MOD.Phase("fourth", ("true", "4"), {}),
+    ]
+    assert _MOD._selection_gaps_after_invalidation(
+        selected=[phases[1], phases[3]],
+        all_phases=phases,
+        first_execution_index=1,
+    ) == ["third"]
+    assert _MOD._selection_gaps_after_invalidation(
+        selected=[phases[1]],
+        all_phases=phases,
+        first_execution_index=1,
+    ) == []
+    assert _MOD._selection_gaps_after_invalidation(
+        selected=phases[1:],
+        all_phases=phases,
+        first_execution_index=1,
+    ) == []
 
 
 def test_execute_requires_image_digest() -> None:
