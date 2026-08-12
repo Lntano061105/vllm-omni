@@ -137,15 +137,20 @@ def render(result_root: Path) -> str:
         f"- 2 sessions × 3 turns 多轮门禁：`{'PASS' if multiturn.get('passed') is True else 'FAIL'}`",
         f"- 优化 activation 门禁：`{'PASS' if activation.get('passed') is True else 'FAIL'}`",
         f"- Demo 连续运行：`{demo.get('continuous_run_minutes')}` 分钟",
-        f"- Demo 非预期错误 / 音频中断 / 空包：`{demo.get('unexpected_error_count')}` / `{demo.get('audio_interruption_count')}` / `{demo.get('empty_audio_packet_count')}`",
+        f"- Demo 非预期错误 / 音频中断 / 空包 / underrun：`{demo.get('unexpected_error_count')}` / `{demo.get('audio_interruption_count')}` / `{demo.get('empty_audio_packet_count')}` / `{demo.get('audio_underrun_count')}`",
         f"- Demo 服务是否正常退出：`{demo.get('service_exit_clean') is True}`",
         "",
-        "| Demo 场景 | 结果 |",
-        "|---|:---:|",
+        "| Demo 场景 | 结果 | 请求/完成 | 音频包 |",
+        "|---|:---:|---:|---:|",
     ]
     for name in ("text", "audio", "video", "text_audio"):
-        passed = demo.get("scenarios", {}).get(name, {}).get("passed") is True
-        lines.append(f"| {name} | {'PASS' if passed else 'FAIL'} |")
+        scenario = demo.get("scenarios", {}).get(name, {})
+        passed = scenario.get("passed") is True
+        lines.append(
+            f"| {name} | {'PASS' if passed else 'FAIL'} | "
+            f"{scenario.get('request_count')}/{scenario.get('completed_response_count')} | "
+            f"{scenario.get('audio_packet_count', 'N/A')} |"
+        )
     paired_path = result_root / "paired_confirmation/paired_confirmation_gate.json"
     if paired_path.is_file():
         paired = _load(paired_path)
@@ -180,7 +185,7 @@ def render(result_root: Path) -> str:
         "1. 使用环境清单中的不可变镜像 digest 启动官方单卡 910C 容器，并检出本报告 Git commit。",
         "2. 准备 `environment/` 清单中 SHA256 一致的模型、Daily-Omni、Video-MME、Seed-TTS 与 Whisper/WavLM/UTMOS。",
         "3. 执行 `run_official_910c_retest.py --image-digest <digest> --execute --confirm-single-910c`；26 个阶段均须通过。",
-        "4. 接入官方 Demo，完成四场景录屏并填写 `demo/demo_evidence.json`。",
+        "4. 接入官方 Demo，完成四场景录屏和逐请求记录，运行 `finalize_demo_evidence.py` 生成并校验 `demo/demo_evidence.json`。",
         "5. 执行 `render_final_report.py`、`validate_final_evidence.py`、`build_final_submission.py` 和最终 `validate_final_evidence.py --require-package`。",
         "",
         "## 复现与制品",

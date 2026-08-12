@@ -1,0 +1,12 @@
+{
+  "official_910c": true,
+  "demo_name": "vLLM-Omni official MiniCPM-o 4.5 Demo",
+  "started_utc": "REPLACE_ME",
+  "finished_utc": "REPLACE_ME",
+  "continuous_run_minutes": 0,
+  "service_exit_clean": false,
+  "unexpected_error_count": 0,
+  "audio_interruption_count": 0,
+  "empty_audio_packet_count": 0,
+  "audio_underrun_count": 0
+}

@@ -33,6 +33,7 @@ REQUIRED = (
     PACKAGE_ROOT / "scripts/analyze_paired_confirmation.py",
     PACKAGE_ROOT / "scripts/validate_official_910c_host.py",
     PACKAGE_ROOT / "scripts/validate_final_evidence.py",
+    PACKAGE_ROOT / "scripts/finalize_demo_evidence.py",
     PACKAGE_ROOT / "scripts/render_final_report.py",
     PACKAGE_ROOT / "scripts/build_final_submission.py",
     PACKAGE_ROOT / "scripts/run_protocol.py",
@@ -47,6 +48,8 @@ REQUIRED = (
     PACKAGE_ROOT / "scripts/validate_submission_package.py",
     PACKAGE_ROOT / "scripts/build_submission_artifacts.py",
     PACKAGE_ROOT / "DEMO_EVIDENCE_TEMPLATE.json",
+    PACKAGE_ROOT / "DEMO_RUN_METADATA_TEMPLATE.json",
+    PACKAGE_ROOT / "DEMO_SCENARIO_EVIDENCE_TEMPLATE.json",
 )
 FORBIDDEN_TRACKED_PREFIXES = (
     "competition/minicpmo_b/results/",

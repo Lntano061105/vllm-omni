@@ -1,0 +1,14 @@
+{
+  "scenario": "REPLACE_WITH_text_OR_audio_OR_video_OR_text_audio",
+  "requests": [
+    {
+      "request_id": "REPLACE_WITH_UNIQUE_REQUEST_ID",
+      "started_utc": "REPLACE_ME",
+      "finished_utc": "REPLACE_ME",
+      "completed": false,
+      "audio_packet_count": 0,
+      "output_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+      "output_sha256": "GENERATED_BY_finalize_demo_evidence.py"
+    }
+  ]
+}

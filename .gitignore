@@ -242,6 +242,8 @@ datasets/
 *.csv
 *.json
 !competition/minicpmo_b/DEMO_EVIDENCE_TEMPLATE.json
+!competition/minicpmo_b/DEMO_RUN_METADATA_TEMPLATE.json
+!competition/minicpmo_b/DEMO_SCENARIO_EVIDENCE_TEMPLATE.json
 !tests/dfx/perf/tests/*.json
 !apps/ComfyUI-vLLM-Omni/example_workflows/*.json
 !tests/assets/soulxsinger/*.json

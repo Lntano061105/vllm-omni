@@ -14,7 +14,7 @@
 | Video-MME 完整集 | 通过（910B4 优化版开发证据） | `results/candidates/fixed13_25_cacheoff_videomme_n2700_v1/`：2700/2700 完成、0 失败、accuracy=0.6962962963、fatal gate 通过；官方 910C 仍须重跑基线和优化版 |
 | Seed-TTS 完整集 | 未完成 | 2026-08-12 优化版已完成 1000/1000 音频请求、0 请求失败、continuity=100%，但 CPU Whisper WER 在用户要求释放资源时中断且未落盘最终 JSON，不能作为精度证据；仍需 mean WER ≤ 0.05、SIM/UTMOS 各 1000/1000、零空 PCM/请求/ASR/质量评测失败；当前镜像缺 WavLM/UTMOS 离线权重 |
 | 相对官方基线精度降幅 ≤ 2pp | 未验证 | 三项完整集必须同时保存官方基线与优化结果 |
-| 官方 Demo 文本/音频/视频/text+audio | 未完成 | 录屏、操作步骤、服务日志及其 SHA256；四场景各自保存非空 evidence JSON、请求/完成计数，含音频输出的场景保存正数 audio packet 计数；带时区起止时间与连续运行时长一致；音频中断/空包/underrun/意外错误均为 0，服务自然退出且日志无 fatal marker |
+| 官方 Demo 文本/音频/视频/text+audio | 未完成 | 使用 `finalize_demo_evidence.py` 从运行元数据与四场景逐请求 JSON 重算请求/完成/audio packet 计数并生成全文件 SHA256；带时区起止时间与连续运行时长一致；音频中断/空包/underrun/意外错误均为 0，服务自然退出且日志无 fatal marker；`validate_final_evidence.py --demo-only` 必须通过 |
 | 官方单卡 910C c1/c4/c8 | 未完成 | 基线与优化三组原始 JSON、activation gate、同输入/顺序/warmup |
 | 官方 910C 多轮稳定性 | 未完成 | `run_duplex_matrix.sh` 已自动强制同一 WebSocket session 的 2 sessions × 3 turns 生命周期字段与服务日志水位告警门禁；仍需官方 910C 原始 JSON/日志 |
 | 离线同步与异步回归 | 通过（当前工作树） | 冻结镜像保持 `pytest==8.3.2`（`triton-ascend` 硬依赖）并安装兼容的 `pytest-asyncio==1.3.0` 后，目标集合标准 pytest 单轮 506 passed、0 skipped；仓库 dev extra 的 pytest 9.1.1/pytest-asyncio 1.4.0 需在隔离 venv 使用 |

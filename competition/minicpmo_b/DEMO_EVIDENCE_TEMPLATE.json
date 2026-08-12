@@ -4,6 +4,8 @@
   "started_utc": "REPLACE_ME",
   "finished_utc": "REPLACE_ME",
   "continuous_run_minutes": 0,
+  "metadata_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+  "metadata_sha256": "REPLACE_WITH_SHA256",
   "service_log": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
   "service_log_sha256": "REPLACE_WITH_SHA256",
   "video_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
@@ -17,6 +19,7 @@
     "text": {
       "passed": false,
       "evidence_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+      "evidence_sha256": "REPLACE_WITH_SHA256",
       "request_count": 0,
       "completed_response_count": 0,
       "notes": ""
@@ -24,6 +27,7 @@
     "audio": {
       "passed": false,
       "evidence_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+      "evidence_sha256": "REPLACE_WITH_SHA256",
       "request_count": 0,
       "completed_response_count": 0,
       "audio_packet_count": 0,
@@ -32,6 +36,7 @@
     "video": {
       "passed": false,
       "evidence_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+      "evidence_sha256": "REPLACE_WITH_SHA256",
       "request_count": 0,
       "completed_response_count": 0,
       "audio_packet_count": 0,
@@ -40,6 +45,7 @@
     "text_audio": {
       "passed": false,
       "evidence_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+      "evidence_sha256": "REPLACE_WITH_SHA256",
       "request_count": 0,
       "completed_response_count": 0,
       "audio_packet_count": 0,

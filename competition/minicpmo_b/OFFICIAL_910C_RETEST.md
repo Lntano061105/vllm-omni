@@ -340,12 +340,18 @@ PORT=8091 competition/minicpmo_b/scripts/start_server.sh
 HTTP/Demo 错误、音频中断次数、空包、underrun 和 NPU 资源峰值。视频必须能看出
 首段音频开始播放、后续 chunk 连续到达以及完整交互结束。
 
-复制机器可读的 Demo 证据模板，并在录制完成后填入相对路径与真实统计：
+先复制运行元数据和逐请求场景模板。`DEMO_EVIDENCE_TEMPLATE.json` 是生成结果的
+字段参考，不再手工填写总计数：
 
 ```bash
 mkdir -p competition/minicpmo_b/results/official_910c/demo
-cp competition/minicpmo_b/DEMO_EVIDENCE_TEMPLATE.json \
-  competition/minicpmo_b/results/official_910c/demo/demo_evidence.json
+DEMO_ROOT=competition/minicpmo_b/results/official_910c/demo
+cp competition/minicpmo_b/DEMO_RUN_METADATA_TEMPLATE.json \
+  "$DEMO_ROOT/demo_run_metadata.json"
+for scenario in text audio video text_audio; do
+  cp competition/minicpmo_b/DEMO_SCENARIO_EVIDENCE_TEMPLATE.json \
+    "$DEMO_ROOT/scenario_${scenario}.json"
+done
 ```
 
 建议使用以下目录布局，所有清单路径都相对于 `demo/`，不得使用绝对路径、`..` 或
@@ -354,6 +360,7 @@ cp competition/minicpmo_b/DEMO_EVIDENCE_TEMPLATE.json \
 ```text
 demo/
 ├── demo_evidence.json
+├── demo_run_metadata.json
 ├── server.log
 ├── demo.mp4
 ├── scenario_text.json
@@ -362,12 +369,10 @@ demo/
 └── scenario_text_audio.json
 ```
 
-四个 `scenarios.*.passed` 必须分别由文本、音频、视频和 text+audio 的完整交互
-证明；不要仅凭 HTTP 200 填写通过。每个场景还必须填写独立且非空的
-`evidence_file`、正数 `request_count`，并使 `completed_response_count` 与请求数完全
-相等。音频、视频和 text+audio 场景还必须填写正数 `audio_packet_count`。场景证据
-JSON 至少保存请求 ID、输入类型、开始/结束时间、HTTP/WebSocket 完成状态、收到的
-音频包数和输出文件；原始 Demo/浏览器事件导出优先于手写摘要。
+四份 `scenario_*.json` 必须分别由文本、音频、视频和 text+audio 的完整交互证明；
+不要仅凭 HTTP 200 填写通过。每个请求记录唯一 request ID、带时区开始/结束时间、
+`completed`、相对于 Demo 根目录的非空输出文件；音频、视频和 text+audio 请求还要
+记录实际收到的正数 `audio_packet_count`。原始 Demo/浏览器事件导出优先于手写摘要。
 
 `started_utc` 与 `finished_utc` 使用带时区的 ISO-8601，例如
 `2026-08-12T12:00:00Z`；`continuous_run_minutes` 不得大于两者的真实时间跨度。
@@ -375,28 +380,30 @@ JSON 至少保存请求 ID、输入类型、开始/结束时间、HTTP/WebSocket
 `unexpected_error_count` 必须由实际采集结果填写且最终均为 0。服务必须自然退出，
 并设置 `service_exit_clean=true`。
 
-`service_log` 与 `video_file` 必须指向 Demo 目录内的非空文件。录屏仅接受可识别的
-MP4/WebM 文件头；改扩展名的文本文件会被拒绝。录制结束后计算真实摘要并填入
-`service_log_sha256` 和 `video_sha256`：
+`server.log` 与 `demo.mp4` 必须是 Demo 目录内的非空文件。录屏仅接受可识别的
+MP4/WebM 文件头；改扩展名的文本文件会被拒绝。录制与服务自然退出后运行收口工具：
 
 ```bash
-cd competition/minicpmo_b/results/official_910c/demo
-sha256sum server.log demo.mp4
+python competition/minicpmo_b/scripts/finalize_demo_evidence.py \
+  --demo-root competition/minicpmo_b/results/official_910c/demo
 ```
 
-最终审计会重新计算 SHA256，并扫描服务日志中的 `Traceback`、`ERROR`、
+该工具从逐请求记录重算四场景请求数、完成数与音频包数，为元数据、四份场景 JSON、
+每个输出文件、服务日志和录屏生成 SHA256，再原子写入 `demo_evidence.json` 并立即
+运行 Demo-only 门禁。最终审计仍会独立重算全部计数和哈希，并扫描服务日志中的
+`Traceback`、`ERROR`、
 `ERR99999`、segmentation fault 和 engine core initialization failure。任何命中都
 必须先定位并重新完成干净的 Demo 稳定性运行，不能只从日志中删除对应行。
 
 结束后在服务所在终端发送一次 Ctrl-C，并等待 API Server 与全部 Stage 进程
 自然完成清理；不要用 `kill/pkill` 跳过编排器的退出流程。
 
-在构建最终包之前，可单独运行全证据审计检查 Demo 字段；其他尚未完成的 910C
-证据仍会按预期失败，但输出中不应再出现 `Demo ...` 失败项：
+在构建最终包之前也可随时单独重跑 Demo 审计，不受其他尚未完成的 910C 证据影响：
 
 ```bash
 python competition/minicpmo_b/scripts/validate_final_evidence.py \
-  --output competition/minicpmo_b/results/official_910c/final_evidence_audit.json
+  --demo-only \
+  --demo-root competition/minicpmo_b/results/official_910c/demo
 ```
 
 ## 7. 提交审计

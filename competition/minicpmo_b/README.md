@@ -199,6 +199,17 @@ python competition/minicpmo_b/scripts/build_final_submission.py
 python competition/minicpmo_b/scripts/validate_final_evidence.py --require-package
 ```
 
+官方 Demo 录屏结束后，先从 `DEMO_RUN_METADATA_TEMPLATE.json` 和
+`DEMO_SCENARIO_EVIDENCE_TEMPLATE.json` 的逐请求记录生成哈希绑定的总清单：
+
+```bash
+python competition/minicpmo_b/scripts/finalize_demo_evidence.py \
+  --demo-root competition/minicpmo_b/results/official_910c/demo
+python competition/minicpmo_b/scripts/validate_final_evidence.py \
+  --demo-only \
+  --demo-root competition/minicpmo_b/results/official_910c/demo
+```
+
 该命令不会启动服务；它会拒绝缺失的 910C 原始结果、完整精度、Demo 视频/日志、
 未填写报告或非干净源码制品。
 

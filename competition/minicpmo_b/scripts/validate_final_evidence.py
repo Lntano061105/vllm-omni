@@ -168,6 +168,18 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _timezone_aware_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value or value == "REPLACE_ME":
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
 def _exists(path: Path, failures: list[str]) -> None:
     if not path.is_file():
         failures.append(f"missing evidence file: {path}")
@@ -653,12 +665,10 @@ def _check_demo(demo_root: Path, failures: list[str]) -> None:
         if not isinstance(value, str) or not value or value == "REPLACE_ME":
             failures.append(f"Demo {key} is not populated")
         else:
-            try:
-                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                if parsed.tzinfo is None or parsed.utcoffset() is None:
-                    raise ValueError("timezone is required")
+            parsed = _timezone_aware_datetime(value)
+            if parsed is not None:
                 timestamps[key] = parsed
-            except ValueError:
+            else:
                 failures.append(
                     f"Demo {key} is not a valid timezone-aware ISO-8601 timestamp"
                 )
@@ -679,6 +689,47 @@ def _check_demo(demo_root: Path, failures: list[str]) -> None:
             failures.append(
                 "Demo continuous_run_minutes exceeds timestamp elapsed duration"
             )
+    raw_metadata = manifest.get("metadata_file")
+    if not isinstance(raw_metadata, str) or raw_metadata.startswith("REPLACE_"):
+        failures.append("Demo metadata_file is not populated")
+    else:
+        raw_metadata_path = demo_root / raw_metadata
+        metadata_path = raw_metadata_path.resolve()
+        try:
+            metadata_path.relative_to(demo_root.resolve())
+        except ValueError:
+            failures.append("Demo metadata_file escapes demo root")
+        else:
+            if raw_metadata_path.is_symlink():
+                failures.append("Demo metadata_file is a symlink")
+            _nonempty(metadata_path, failures)
+            expected_metadata_sha = manifest.get("metadata_sha256")
+            if not isinstance(expected_metadata_sha, str) or not re.fullmatch(
+                r"[0-9a-fA-F]{64}", expected_metadata_sha
+            ):
+                failures.append("Demo metadata_sha256 is not a valid SHA256")
+            elif metadata_path.is_file() and _sha256_file(
+                metadata_path
+            ) != expected_metadata_sha.lower():
+                failures.append("Demo metadata_file SHA256 mismatch")
+            metadata = _json(metadata_path, failures)
+            if metadata is not None:
+                for key in (
+                    "official_910c",
+                    "demo_name",
+                    "started_utc",
+                    "finished_utc",
+                    "continuous_run_minutes",
+                    "service_exit_clean",
+                    "unexpected_error_count",
+                    "audio_interruption_count",
+                    "empty_audio_packet_count",
+                    "audio_underrun_count",
+                ):
+                    if metadata.get(key) != manifest.get(key):
+                        failures.append(
+                            f"Demo metadata {key} differs from generated manifest"
+                        )
     scenarios = manifest.get("scenarios")
     scenario_evidence_paths: set[Path] = set()
     for name in ("text", "audio", "video", "text_audio"):
@@ -719,7 +770,8 @@ def _check_demo(demo_root: Path, failures: list[str]) -> None:
         if not isinstance(raw_evidence, str) or raw_evidence.startswith("REPLACE_"):
             failures.append(f"Demo scenario {name} evidence_file is not populated")
         else:
-            evidence_path = (demo_root / raw_evidence).resolve()
+            raw_evidence_path = demo_root / raw_evidence
+            evidence_path = raw_evidence_path.resolve()
             try:
                 evidence_path.relative_to(demo_root.resolve())
             except ValueError:
@@ -727,23 +779,159 @@ def _check_demo(demo_root: Path, failures: list[str]) -> None:
                     f"Demo scenario {name} evidence_file escapes demo root"
                 )
             else:
+                if raw_evidence_path.is_symlink():
+                    failures.append(
+                        f"Demo scenario {name} evidence_file is a symlink"
+                    )
                 if evidence_path in scenario_evidence_paths:
                     failures.append(
                         f"Demo scenario {name} evidence_file is not independent"
                     )
                 scenario_evidence_paths.add(evidence_path)
                 _nonempty(evidence_path, failures)
+                expected_evidence_sha = scenario.get("evidence_sha256")
+                if not isinstance(expected_evidence_sha, str) or not re.fullmatch(
+                    r"[0-9a-fA-F]{64}", expected_evidence_sha
+                ):
+                    failures.append(
+                        f"Demo scenario {name} evidence_sha256 is not a valid SHA256"
+                    )
+                elif evidence_path.is_file() and _sha256_file(
+                    evidence_path
+                ) != expected_evidence_sha.lower():
+                    failures.append(
+                        f"Demo scenario {name} evidence_file SHA256 mismatch"
+                    )
+                evidence = _json(evidence_path, failures)
+                if evidence is not None:
+                    if evidence.get("scenario") != name:
+                        failures.append(
+                            f"Demo scenario {name} evidence declares "
+                            f"scenario={evidence.get('scenario')!r}"
+                        )
+                    requests = evidence.get("requests")
+                    if not isinstance(requests, list) or not requests:
+                        failures.append(
+                            f"Demo scenario {name} evidence requests must be non-empty"
+                        )
+                    else:
+                        completed_from_evidence = 0
+                        packets_from_evidence = 0
+                        request_ids: set[str] = set()
+                        for index, request in enumerate(requests):
+                            prefix = f"Demo scenario {name} request[{index}]"
+                            if not isinstance(request, dict):
+                                failures.append(f"{prefix} is not an object")
+                                continue
+                            request_id = request.get("request_id")
+                            if not isinstance(request_id, str) or not request_id:
+                                failures.append(f"{prefix} request_id is not populated")
+                            elif request_id in request_ids:
+                                failures.append(f"{prefix} request_id is duplicated")
+                            else:
+                                request_ids.add(request_id)
+                            request_started = _timezone_aware_datetime(
+                                request.get("started_utc")
+                            )
+                            request_finished = _timezone_aware_datetime(
+                                request.get("finished_utc")
+                            )
+                            if request_started is None or request_finished is None:
+                                failures.append(
+                                    f"{prefix} timestamps must be timezone-aware ISO-8601"
+                                )
+                            elif request_finished <= request_started:
+                                failures.append(
+                                    f"{prefix} finished_utc must be after started_utc"
+                                )
+                            elif set(timestamps) == {"started_utc", "finished_utc"} and (
+                                request_started < timestamps["started_utc"]
+                                or request_finished > timestamps["finished_utc"]
+                            ):
+                                failures.append(
+                                    f"{prefix} timestamps fall outside Demo run interval"
+                                )
+                            if request.get("completed") is True:
+                                completed_from_evidence += 1
+                            else:
+                                failures.append(f"{prefix} did not complete")
+                            packet_count = request.get("audio_packet_count", 0)
+                            if name != "text" and (
+                                isinstance(packet_count, bool)
+                                or not isinstance(packet_count, int)
+                                or packet_count <= 0
+                            ):
+                                failures.append(
+                                    f"{prefix} audio_packet_count must be positive"
+                                )
+                            elif isinstance(packet_count, int) and not isinstance(
+                                packet_count, bool
+                            ):
+                                packets_from_evidence += packet_count
+                            raw_output = request.get("output_file")
+                            if not isinstance(raw_output, str) or raw_output.startswith(
+                                "REPLACE_"
+                            ):
+                                failures.append(f"{prefix} output_file is not populated")
+                            else:
+                                raw_output_path = demo_root / raw_output
+                                output_path = raw_output_path.resolve()
+                                try:
+                                    output_path.relative_to(demo_root.resolve())
+                                except ValueError:
+                                    failures.append(
+                                        f"{prefix} output_file escapes demo root"
+                                    )
+                                else:
+                                    if raw_output_path.is_symlink():
+                                        failures.append(
+                                            f"{prefix} output_file is a symlink"
+                                        )
+                                    _nonempty(output_path, failures)
+                                    expected_output_sha = request.get("output_sha256")
+                                    if not isinstance(
+                                        expected_output_sha, str
+                                    ) or not re.fullmatch(
+                                        r"[0-9a-fA-F]{64}", expected_output_sha
+                                    ):
+                                        failures.append(
+                                            f"{prefix} output_sha256 is not a valid SHA256"
+                                        )
+                                    elif output_path.is_file() and _sha256_file(
+                                        output_path
+                                    ) != expected_output_sha.lower():
+                                        failures.append(
+                                            f"{prefix} output_file SHA256 mismatch"
+                                        )
+                        if request_count != len(requests):
+                            failures.append(
+                                f"Demo scenario {name} request_count={request_count!r}, "
+                                f"evidence has {len(requests)} request(s)"
+                            )
+                        if completed != completed_from_evidence:
+                            failures.append(
+                                f"Demo scenario {name} completed_response_count={completed!r}, "
+                                f"evidence has {completed_from_evidence} completed request(s)"
+                            )
+                        if name != "text" and packets != packets_from_evidence:
+                            failures.append(
+                                f"Demo scenario {name} audio_packet_count={packets!r}, "
+                                f"evidence has {packets_from_evidence} packet(s)"
+                            )
     for key in ("service_log", "video_file"):
         raw = manifest.get(key)
         if not isinstance(raw, str) or not raw or raw == "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT":
             failures.append(f"Demo {key} is not populated")
         else:
-            path = (demo_root / raw).resolve()
+            raw_path = demo_root / raw
+            path = raw_path.resolve()
             try:
                 path.relative_to(demo_root.resolve())
             except ValueError:
                 failures.append(f"Demo {key} escapes demo root: {raw}")
             else:
+                if raw_path.is_symlink():
+                    failures.append(f"Demo {key} is a symlink")
                 _nonempty(path, failures)
                 sha_key = (
                     "service_log_sha256" if key == "service_log" else "video_sha256"
@@ -773,6 +961,17 @@ def _check_demo(demo_root: Path, failures: list[str]) -> None:
                     )
                     if any(re.search(pattern, log_text) for pattern in fatal_patterns):
                         failures.append("Demo service_log contains fatal error markers")
+
+
+def audit_demo(demo_root: Path) -> dict[str, Any]:
+    failures: list[str] = []
+    _check_demo(demo_root.expanduser().resolve(), failures)
+    return {
+        "passed": not failures,
+        "demo_root": str(demo_root.expanduser().resolve()),
+        "failure_count": len(failures),
+        "failures": failures,
+    }
 
 
 def _check_source(source_root: Path, failures: list[str]) -> None:
@@ -984,15 +1183,26 @@ def main() -> int:
         action="store_true",
         help="Also verify the already-built final submission archive.",
     )
+    parser.add_argument(
+        "--demo-only",
+        action="store_true",
+        help="Only validate the structured Demo evidence directory.",
+    )
     args = parser.parse_args()
     result_root = args.result_root.expanduser().resolve()
-    result = audit(
-        result_root=result_root,
-        demo_root=(args.demo_root or result_root / "demo").expanduser().resolve(),
-        source_root=(args.source_root or result_root / "final_submission/source").expanduser().resolve(),
-        report=(args.report or result_root / "final_submission/FINAL_REPORT.md").expanduser().resolve(),
-        require_package=args.require_package,
-    )
+    demo_root = (args.demo_root or result_root / "demo").expanduser().resolve()
+    if args.demo_only:
+        if args.require_package:
+            parser.error("--demo-only cannot be combined with --require-package")
+        result = audit_demo(demo_root)
+    else:
+        result = audit(
+            result_root=result_root,
+            demo_root=demo_root,
+            source_root=(args.source_root or result_root / "final_submission/source").expanduser().resolve(),
+            report=(args.report or result_root / "final_submission/FINAL_REPORT.md").expanduser().resolve(),
+            require_package=args.require_package,
+        )
     rendered = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
     print(rendered)
     if args.output is not None:

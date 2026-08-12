@@ -340,12 +340,45 @@ def _build_complete_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         b"\x00\x00\x00\x18ftypmp42" + b"demo-recording" * 8
     )
     scenarios = {}
+    metadata_payload = {
+        "official_910c": True,
+        "demo_name": "vLLM-Omni official MiniCPM-o 4.5 Demo",
+        "started_utc": "2026-08-12T00:00:00Z",
+        "finished_utc": "2026-08-12T00:30:00Z",
+        "continuous_run_minutes": 30,
+        "service_exit_clean": True,
+        "unexpected_error_count": 0,
+        "audio_interruption_count": 0,
+        "empty_audio_packet_count": 0,
+        "audio_underrun_count": 0,
+    }
+    _write_json(demo / "demo_run_metadata.json", metadata_payload)
     for name in ("text", "audio", "video", "text_audio"):
         evidence_name = f"scenario_{name}.json"
-        _write_json(demo / evidence_name, {"scenario": name, "completed": True})
+        output_name = f"output_{name}.txt"
+        _write(demo / output_name, f"completed output for {name}\n")
+        request = {
+            "request_id": f"demo-{name}-1",
+            "started_utc": "2026-08-12T00:01:00Z",
+            "finished_utc": "2026-08-12T00:02:00Z",
+            "completed": True,
+            "output_file": output_name,
+            "output_sha256": hashlib.sha256(
+                (demo / output_name).read_bytes()
+            ).hexdigest(),
+        }
+        if name != "text":
+            request["audio_packet_count"] = 4
+        _write_json(
+            demo / evidence_name,
+            {"scenario": name, "requests": [request]},
+        )
         scenario = {
             "passed": True,
             "evidence_file": evidence_name,
+            "evidence_sha256": hashlib.sha256(
+                (demo / evidence_name).read_bytes()
+            ).hexdigest(),
             "request_count": 1,
             "completed_response_count": 1,
         }
@@ -355,10 +388,11 @@ def _build_complete_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     _write_json(
         demo / "demo_evidence.json",
         {
-            "official_910c": True,
-            "started_utc": "2026-08-12T00:00:00Z",
-            "finished_utc": "2026-08-12T00:30:00Z",
-            "continuous_run_minutes": 30,
+            **metadata_payload,
+            "metadata_file": "demo_run_metadata.json",
+            "metadata_sha256": hashlib.sha256(
+                (demo / "demo_run_metadata.json").read_bytes()
+            ).hexdigest(),
             "service_log": "server.log",
             "service_log_sha256": hashlib.sha256(
                 (demo / "server.log").read_bytes()
@@ -367,11 +401,6 @@ def _build_complete_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             "video_sha256": hashlib.sha256(
                 (demo / "demo.mp4").read_bytes()
             ).hexdigest(),
-            "service_exit_clean": True,
-            "unexpected_error_count": 0,
-            "audio_interruption_count": 0,
-            "empty_audio_packet_count": 0,
-            "audio_underrun_count": 0,
             "scenarios": scenarios,
         },
     )
