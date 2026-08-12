@@ -1,0 +1,50 @@
+# Correctness-first fixed-shape candidate with all scored-request compilation
+# moved into startup. Both Stage 0 and Code2Wav preload the exact reference
+# voice used by the official Demo/benchmark on physical NPU 5.
+base_config: minicpmo_4_5_duplex_euler_local4_graph_sampler_cpu_slot_npu5.yaml
+
+stages:
+  - stage_id: 0
+    # Avoid sender/receiver LRU divergence during long multimodal runs.  This
+    # is the physical-NPU-5 validation form of the portable 910C setting.
+    mm_processor_cache_gb: 0
+    engine_extras:
+      hf_overrides:
+        minicpmo45_runtime_config:
+          stage0_ref_audio_embedding_cache_size: 4
+          stage0_ref_audio_embedding_preload_wavs:
+            - assets/system_ref_audio.wav
+          stage0_ref_audio_embedding_preload_sample_rate: 16000
+          stage0_ref_audio_embedding_preload_frame_samples: 1600
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      code2wav_cache_initial_state: true
+      code2wav_cross_prompt_batching: true
+      code2wav_runtime_prompt_cache_size: 4
+      code2wav_cache_runtime_initial_state: true
+      code2wav_runtime_prompt_preload_wavs:
+        - assets/system_ref_audio.wav
+      code2wav_runtime_prompt_preload_sample_rate: 16000
+      code2wav_runtime_prompt_preload_frame_samples: 1600
+      code2wav_prewarm: true
+      code2wav_runner_prewarm: true
+      token2wav_cfg_mode: conditional
+      token2wav_solver: euler
+      token2wav_n_timesteps: 1
+      token2wav_remove_hift_weight_norm: true
+      talker_emit_codec_chunks: true
+      initial_codec_chunk_frames: 13
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      talker_local_decode_stage_id: 1
+      talker_local_decode_steps: 4
+      talker_local_cpu_slot_mapping: true
+      talker_graph_sampler: true
+      talker_binary_argmax: true
+      talker_fixed_nonfinal_codec_chunks: true

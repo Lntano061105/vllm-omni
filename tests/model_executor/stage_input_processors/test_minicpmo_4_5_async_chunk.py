@@ -17,10 +17,16 @@ from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import (
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def _manager(*, initial_chunk_frames: int = 0):
+def _manager(
+    *,
+    initial_chunk_frames: int = 0,
+    fixed_nonfinal_chunks: bool = False,
+):
     extra = {"codec_chunk_frames": 25, "codec_left_context_frames": 3}
     if initial_chunk_frames:
         extra["initial_codec_chunk_frames"] = initial_chunk_frames
+    if fixed_nonfinal_chunks:
+        extra["talker_fixed_nonfinal_codec_chunks"] = True
     return SimpleNamespace(
         connector=SimpleNamespace(config={"extra": extra}),
         code_prompt_token_ids=defaultdict(list),
@@ -422,6 +428,61 @@ def test_duplex_short_units_wait_for_minimum_stream_body() -> None:
         second.meta.llm_output_text_utf8,
         torch.tensor(list(b"firstfirst"), dtype=torch.uint8),
     )
+
+
+def test_duplex_fixed_nonfinal_chunks_use_only_prewarmed_shapes() -> None:
+    manager = _manager(
+        initial_chunk_frames=13,
+        fixed_nonfinal_chunks=True,
+    )
+    request = _request("req-duplex")
+
+    held_initial = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(10), text="first"),
+        request,
+        True,
+    )
+    initial = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(10, 13), text="second"),
+        request,
+        True,
+    )
+    held_steady = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(13, 23), text="third"),
+        request,
+        True,
+    )
+    steady = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(23, 38), text="fourth"),
+        request,
+        True,
+    )
+    tail = tts2code2wav_async_chunk(
+        manager,
+        _duplex_delta(*range(38, 45), text="tail", turn_end=True),
+        request,
+        True,
+    )
+
+    assert held_initial is not None
+    assert held_initial.meta.code_flat_numel == 0
+    assert initial is not None
+    assert initial.meta.codec_chunk_frames == 13
+    assert _codes(initial) == [4218, 4218, 4218, *range(13)]
+    assert held_steady is not None
+    assert held_steady.meta.code_flat_numel == 0
+    assert steady is not None
+    assert steady.meta.codec_chunk_frames == 25
+    assert _codes(steady) == [10, 11, 12, *range(13, 38)]
+    assert tail is not None
+    assert tail.meta.codec_chunk_frames == 7
+    assert _codes(tail) == [35, 36, 37, *range(38, 45)]
+    assert tail.meta.speak_tail is True
+    assert tail.meta.turn_end is True
 
 
 def test_duplex_empty_finish_callback_does_not_replay_previous_text() -> None:

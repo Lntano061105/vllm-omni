@@ -213,6 +213,7 @@ def build_serve_common_argv(
     endpoint: str = "/v1/chat/completions",
     temperature: float | None = None,
     output_len: int | None = None,
+    seed: int = 0,
 ) -> list[str]:
     out = [
         "bench",
@@ -235,6 +236,8 @@ def build_serve_common_argv(
         "--max-concurrency",
         str(max_concurrency),
         "--no-oversample",
+        "--seed",
+        str(seed),
         "--num-warmups",
         str(num_warmups),
         "--percentile-metrics",

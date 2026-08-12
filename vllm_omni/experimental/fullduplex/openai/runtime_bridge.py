@@ -317,12 +317,18 @@ class NativeRuntimeBridgeMixin:
     # official full-duplex behavior where the microphone keeps streaming
     # silence while the assistant speaks; replies span multiple units.
     _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
+    _NATIVE_SILENCE_PAYLOAD_AUDIO_CACHE = {1: _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO}
     _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 8
 
-    def _native_silence_unit_payload(self) -> dict[str, object]:
+    def _native_silence_unit_payload(self, *, units: int = 1) -> dict[str, object]:
+        units = max(1, int(units))
+        audio = self._NATIVE_SILENCE_PAYLOAD_AUDIO_CACHE.get(units)
+        if audio is None:
+            audio = base64.b64encode(bytes(16000 * 4 * units)).decode("ascii")
+            self._NATIVE_SILENCE_PAYLOAD_AUDIO_CACHE[units] = audio
         return {
             "type": "audio",
-            "audio": self._NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO,
+            "audio": audio,
             "format": "pcm_f32le",
             "sample_rate_hz": 16000,
         }
@@ -400,7 +406,18 @@ class NativeRuntimeBridgeMixin:
         count = native.continuation_units if native.continuation_owner_id == owner_id else 0
         if not auto_response and count >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
             return
-        payload = self._native_silence_unit_payload()
+        units_per_append = self._duplex_session_config.native_silence_continuation_units_per_append
+        if (
+            self._duplex_session_config.native_silence_batch_after_first_audio_only
+            and session.playback.sent_ms <= 0
+        ):
+            units_per_append = 1
+        if not auto_response:
+            units_per_append = min(
+                units_per_append,
+                self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS - count,
+            )
+        payload = self._native_silence_unit_payload(units=units_per_append)
         payload["duplex_turn_id"] = payload_turn_id
 
         scheduler = native.silence_continuation_scheduler
@@ -423,7 +440,7 @@ class NativeRuntimeBridgeMixin:
             scheduled = False
         if scheduled:
             native.continuation_owner_id = owner_id
-            native.continuation_units = count + 1
+            native.continuation_units = count + units_per_append
 
     async def _cancel_native_data_plane_stream(self, session: DuplexSession) -> bool:
         native = self._runtime_session_state(session)

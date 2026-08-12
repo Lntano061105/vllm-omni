@@ -17,6 +17,8 @@ from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni_tts import (
     _apply_repetition_penalty_scatter,
     _apply_top_k_top_p,
     _compact_top_k_top_p_candidates,
+    _exact_top_p_then_top_k_candidates,
+    _fixed_window_repetition_penalty,
     _max_audio_tokens,
     _restore_weight_norm_weight,
 )
@@ -35,6 +37,21 @@ class _FakeNativeTalker(nn.Module):
     def forward(self, **kwargs):
         self.forward_kwargs = kwargs
         return torch.ones(2, 4)
+
+
+class _FakeTTSBackbone(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.linear = nn.Linear(3, 4, bias=False)
+
+    def forward(
+        self,
+        input_ids=None,
+        positions=None,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+    ) -> torch.Tensor:
+        return self.linear(inputs_embeds)
 
 
 def test_wrapper_always_delegates_talker_to_native_ar_path() -> None:
@@ -58,6 +75,7 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     nn.Module.__init__(talker)
     talker._num_audio_tokens = 8
     talker._batch_stop_logits = None
+    talker._talker_binary_argmax_uses = 0
     talker._request_generators = {}
     talker._request_audio_states = {}
     talker._deferred_cleanup_ids = set()
@@ -67,7 +85,21 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker._talker_initial_codec_chunk_frames = 4
     talker._talker_codec_chunk_frames = 25
     talker._talker_compact_sampling = False
+    talker._talker_npu_fused_filter = False
+    talker._talker_npu_sampling_params = None
     talker._talker_scatter_repetition = False
+    talker._talker_graph_head = False
+    talker._talker_graph_sampler = False
+    talker._graph_head_valid = False
+    talker._graph_sampler_valid = False
+    talker.register_buffer(
+        "_binary_control_logit_templates",
+        torch.tensor(
+            [[0.0, float("-inf")], [float("-inf"), 0.0]],
+            dtype=torch.float32,
+        ),
+        persistent=False,
+    )
     return talker
 
 
@@ -177,9 +209,12 @@ def test_top_k_top_p_matches_full_sort_reference(concentrated: bool) -> None:
     torch.testing.assert_close(actual[torch.isfinite(actual)], expected[torch.isfinite(expected)])
 
 
-def test_compact_top_k_candidates_preserve_dense_distribution() -> None:
+@pytest.mark.parametrize("concentrated", [False, True])
+def test_compact_top_k_candidates_preserve_dense_distribution(concentrated: bool) -> None:
     generator = torch.Generator().manual_seed(17)
     logits = torch.randn(2, 127, generator=generator)
+    if concentrated:
+        logits[:, :8] += 12.0
     dense = _apply_top_k_top_p(
         logits,
         top_k=25,
@@ -199,7 +234,78 @@ def test_compact_top_k_candidates_preserve_dense_distribution() -> None:
         dense_probabilities.gather(-1, candidate_ids),
         compact_probabilities,
     )
-    assert torch.count_nonzero(dense_probabilities, dim=-1).tolist() == [25, 25]
+    assert torch.equal(
+        torch.isfinite(dense).gather(-1, candidate_ids),
+        torch.isfinite(candidate_logits),
+    )
+
+
+@pytest.mark.parametrize("concentrated", [False, True])
+def test_exact_top_p_then_top_k_reconstructs_dense_distribution(concentrated: bool) -> None:
+    generator = torch.Generator().manual_seed(29)
+    logits = torch.randn(3, 6562, generator=generator)
+    if concentrated:
+        logits[:, :8] += 12.0
+    dense = _apply_top_k_top_p(
+        logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+
+    candidate_logits, candidate_ids = _exact_top_p_then_top_k_candidates(
+        logits,
+        top_k=25,
+        top_p=0.85,
+        min_tokens_to_keep=3,
+    )
+
+    assert torch.equal(
+        torch.isfinite(dense).gather(-1, candidate_ids),
+        torch.isfinite(candidate_logits),
+    )
+    torch.testing.assert_close(
+        torch.softmax(dense, dim=-1).gather(-1, candidate_ids),
+        torch.softmax(candidate_logits, dim=-1),
+    )
+
+
+def test_fixed_window_repetition_penalty_matches_bincount() -> None:
+    generator = torch.Generator().manual_seed(31)
+    logits = torch.randn(2, 127, generator=generator)
+    histories = torch.tensor(
+        [
+            [-1, -1, -1, 3, 9, 3, 4, 4],
+            [7, 7, 7, 7, 8, 9, 10, 11],
+        ],
+        dtype=torch.long,
+    )
+    penalty_lut = torch.pow(
+        torch.tensor(1.05),
+        torch.arange(histories.shape[1], dtype=torch.float32).add(1),
+    )
+    penalty_lut = torch.cat((torch.ones(1), penalty_lut))
+
+    expected = torch.cat(
+        [
+            _apply_repetition_penalty(
+                logits[row : row + 1],
+                histories[row][histories[row] >= 0],
+                penalty=1.05,
+                window_size=histories.shape[1],
+            )
+            for row in range(logits.shape[0])
+        ],
+        dim=0,
+    )
+    actual = _fixed_window_repetition_penalty(
+        logits,
+        histories,
+        penalty=1.05,
+        penalty_lut=penalty_lut,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> None:
@@ -237,6 +343,185 @@ def test_talker_emits_request_aligned_codec_deltas_after_compaction(mocker) -> N
     assert _routed(output, 0)["meta"]["finished"].item() is False
     assert set(output.multimodal_outputs["meta"]) == {"finished"}
     assert talker.compute_logits(output.text_hidden_states).argmax(dim=-1).tolist() == [0, 0]
+
+
+def test_graph_head_projects_only_runner_selected_rows() -> None:
+    talker = _make_talker()
+    talker._talker_graph_head = True
+    talker.tts_model = mock_model = _FakeTTSBackbone()
+    talker.head_code = nn.ModuleList([nn.Linear(4, 8, bias=False)])
+    talker.register_buffer("_graph_head_logits", torch.empty(2, 8), persistent=False)
+    inputs = torch.arange(9, dtype=torch.float32).reshape(3, 3)
+
+    hidden, projected = talker(
+        inputs_embeds=inputs,
+        omni_logits_indices=torch.tensor([0, 2]),
+    )
+
+    expected_hidden = mock_model(inputs_embeds=inputs)
+    torch.testing.assert_close(hidden, expected_hidden)
+    torch.testing.assert_close(
+        projected,
+        talker.head_code[0](expected_hidden[[0, 2]]),
+    )
+
+
+def test_graph_head_full_decode_projects_static_row_prefix() -> None:
+    talker = _make_talker()
+    talker._talker_graph_head = True
+    talker.tts_model = mock_model = _FakeTTSBackbone()
+    talker.head_code = nn.ModuleList([nn.Linear(4, 8, bias=False)])
+    inputs = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    hidden, projected = talker(
+        inputs_embeds=inputs,
+        omni_num_sample_rows=2,
+    )
+
+    expected_hidden = mock_model(inputs_embeds=inputs)
+    torch.testing.assert_close(hidden, expected_hidden)
+    torch.testing.assert_close(projected, talker.head_code[0](expected_hidden[:2]))
+
+
+def test_graph_sampler_builds_exact_compact_candidates_inside_forward() -> None:
+    talker = _make_talker()
+    talker._talker_graph_head = True
+    talker._talker_graph_sampler = True
+    talker._codec_temperature = 0.8
+    talker._codec_repetition_penalty = 1.05
+    talker._codec_top_k = 3
+    talker._codec_top_p = 0.85
+    talker.tts_model = _FakeTTSBackbone()
+    talker.head_code = nn.ModuleList([nn.Linear(4, 8, bias=False)])
+    talker.register_buffer("_graph_head_logits", torch.empty(1, 8), persistent=False)
+    talker.register_buffer("_graph_sampler_logits", torch.empty(1, 3), persistent=False)
+    talker.register_buffer(
+        "_graph_sampler_ids",
+        torch.empty(1, 3, dtype=torch.long),
+        persistent=False,
+    )
+    talker.register_buffer(
+        "_codec_repetition_penalty_lut",
+        torch.pow(torch.tensor(1.05), torch.arange(17, dtype=torch.float32)),
+        persistent=False,
+    )
+    inputs = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    history = torch.tensor([[-1] * 14 + [2, 2]], dtype=torch.long)
+
+    hidden, candidate_logits, candidate_ids = talker(
+        inputs_embeds=inputs,
+        omni_logits_indices=torch.tensor([1]),
+        omni_codec_history=history,
+        omni_codec_eos_allowed=torch.tensor([False]),
+    )
+
+    projected = talker.head_code[0](hidden[[1]]).float() / 0.8
+    projected = _fixed_window_repetition_penalty(
+        projected,
+        history,
+        penalty=1.05,
+        penalty_lut=talker._codec_repetition_penalty_lut,
+    )
+    projected[:, 7] = float("-inf")
+    expected_logits, expected_ids = _exact_top_p_then_top_k_candidates(
+        projected,
+        top_k=3,
+        top_p=0.85,
+    )
+
+    torch.testing.assert_close(candidate_logits, expected_logits)
+    torch.testing.assert_close(candidate_ids, expected_ids)
+
+
+def test_graph_sampler_masks_eos_without_indexed_inplace_write() -> None:
+    import ast
+    import inspect
+
+    import textwrap
+
+    source = textwrap.dedent(
+        inspect.getsource(MiniCPMO45OmniTTSForConditionalGeneration.forward)
+    )
+    tree = ast.parse(source)
+    assert not any(
+        isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Subscript) for target in node.targets)
+        for node in ast.walk(tree)
+    )
+
+
+def test_make_omni_output_reuses_graph_head_logits(mocker) -> None:
+    talker = _make_talker()
+    projected = torch.tensor([[11.0, 12.0], [21.0, 22.0]])
+    seen: list[torch.Tensor] = []
+
+    def sample(hidden, history, request_id, step, *, projected_logits=None):
+        assert projected_logits is not None
+        seen.append(projected_logits.clone())
+        return torch.tensor(2 if request_id == "req-a" else 3)
+
+    mocker.patch.object(talker, "_sample_audio_code", side_effect=sample)
+    infos = [
+        {"request_id": "req-a", "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)}},
+        {"request_id": "req-b", "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)}},
+    ]
+
+    talker.make_omni_output(
+        (torch.ones(2, 4), projected),
+        model_intermediate_buffer=infos,
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+
+    assert len(seen) == 2
+    torch.testing.assert_close(seen[0], projected[0:1])
+    torch.testing.assert_close(seen[1], projected[1:2])
+
+
+def test_make_omni_output_reuses_graph_sampler_candidates(mocker) -> None:
+    talker = _make_talker()
+    talker._talker_graph_sampler = True
+    candidate_logits = torch.tensor([[3.0, 2.0, 1.0]])
+    candidate_ids = torch.tensor([[5, 4, 3]])
+    seen: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def sample(hidden, history, request_id, step, *, compact_candidates=None, **kwargs):
+        assert compact_candidates is not None
+        seen.append(tuple(value.clone() for value in compact_candidates))
+        return torch.tensor(5)
+
+    mocker.patch.object(talker, "_sample_audio_code", side_effect=sample)
+    info = {
+        "request_id": "req-graph-sampler",
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    talker.make_omni_output(
+        (torch.ones(1, 4), candidate_logits, candidate_ids),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    )
+
+    assert len(seen) == 1
+    torch.testing.assert_close(seen[0][0], candidate_logits)
+    torch.testing.assert_close(seen[0][1], candidate_ids)
+
+
+def test_talker_binary_sampler_uses_exact_control_argmax() -> None:
+    talker = _make_talker()
+    talker._talker_binary_argmax = True
+    logits = torch.tensor(
+        [
+            [0.0, float("-inf")],
+            [float("-inf"), 0.0],
+            [float("-inf"), float("-inf")],
+        ]
+    )
+
+    output = talker.sample(logits, sampling_metadata=None)
+
+    assert output.logprobs_tensors is None
+    assert output.sampled_token_ids.dtype == torch.int32
+    assert output.sampled_token_ids.tolist() == [[0], [1], [0]]
 
 
 def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
@@ -283,6 +568,41 @@ def test_talker_projects_request_aligned_duplex_metadata(mocker) -> None:
         "second",
     ]
     assert [value.item() for value in meta["turn_end"]] == [False, True]
+
+
+def test_talker_reuses_explicit_request_duplex_metadata_without_rescanning_ids(mocker) -> None:
+    talker = _make_talker()
+    mocker.patch.object(talker, "_sample_audio_code", return_value=torch.tensor(2))
+    any_mock = mocker.patch("torch.any", side_effect=AssertionError("unexpected TTS ID rescan"))
+    info = {
+        "request_id": "req-cached-meta",
+        "native_duplex": True,
+        "duplex": {"epoch": 3, "turn_id": 7},
+        "ids": {"tts": torch.tensor([41, 99])},
+        "meta": {
+            "native_duplex_segment_text": "cached",
+            "turn_eos_token_id": 99,
+            "turn_end": True,
+        },
+        "audio_state": {"step": 0, "min_tokens": 26, "max_tokens": 26},
+        "audio_codes": {"accumulated": torch.empty(0, dtype=torch.long)},
+    }
+
+    first = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    ).multimodal_outputs["meta"]
+    second = talker.make_omni_output(
+        torch.ones(1, 2),
+        model_intermediate_buffer=[info],
+        request_token_spans=[(0, 1)],
+    ).multimodal_outputs["meta"]
+
+    any_mock.assert_not_called()
+    assert first["native_duplex"][0] is second["native_duplex"][0]
+    assert first["llm_output_text_utf8"][0] is second["llm_output_text_utf8"][0]
+    assert second["turn_end"][0].item() is True
 
 
 def test_talker_rejects_native_duplex_without_fence_identity(mocker) -> None:

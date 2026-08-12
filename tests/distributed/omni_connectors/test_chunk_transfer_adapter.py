@@ -405,6 +405,30 @@ def test_save_async_skips_stale_resumable_chunk_until_dedup_is_reset(build_adapt
     assert adapter.requests_num_chunks_sent["ext-stream"] == 0
 
 
+def test_save_async_resets_resumable_watermark_after_segment_boundary(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    adapter.requests_num_chunks_sent["ext-stream"] = 111
+    # A Talker stop resets the scheduler cursor before save_async receives the
+    # sparse terminal packet.  The lower cursor is a real boundary, not a
+    # preemption replay.
+    request.num_computed_tokens = 0
+
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=True)
+
+    assert len(adapter._pending_save_reqs) == 1
+    assert "ext-stream" not in adapter.requests_num_chunks_sent
+
+    # The scheduler starts the next resumable segment from a fresh token
+    # cursor.  It must not be mistaken for a replay of the completed segment.
+    request.num_computed_tokens = 0
+    adapter.save_async(multimodal_output=None, request=request, is_segment_finished=False)
+
+    assert len(adapter._pending_save_reqs) == 2
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 0
+
+
 def test_send_single_request_cleans_up_after_finished_payload(build_adapter, monkeypatch):
     adapter, _ = build_adapter(stage_id=1)
     request = _req("req-finished", RequestStatus.FINISHED_STOPPED, external_req_id="ext-finished")

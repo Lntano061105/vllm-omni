@@ -19,6 +19,7 @@ def test_chunk_accumulation_policy_replaces_snapshots_and_drains_delta_state():
         {
             "audio": torch.tensor([1.0]),
             "meta.segment_end": torch.tensor([0]),
+            "meta.speak_tail": torch.tensor([0]),
             "meta.tts_is_last_chunk": torch.tensor([0]),
             "meta.turn_end": torch.tensor([0]),
             "meta.stable_request_value": "keep",
@@ -28,6 +29,7 @@ def test_chunk_accumulation_policy_replaces_snapshots_and_drains_delta_state():
         {
             "audio": torch.tensor([2.0]),
             "meta.segment_end": torch.tensor([1]),
+            "meta.speak_tail": torch.tensor([1]),
             "meta.tts_is_last_chunk": torch.tensor([1]),
             "meta.turn_end": torch.tensor([1]),
         }
@@ -38,12 +40,14 @@ def test_chunk_accumulation_policy_replaces_snapshots_and_drains_delta_state():
     replace_snapshot_keys(accumulated, incoming)
     merged = accumulated.merged_with(incoming)
 
+    assert merged["meta.speak_tail"].tolist() == [1]
     assert not is_non_final_delta_audio_chunk(merged, "audio")
 
     drain_delta_payload(merged)
 
     assert "audio" not in merged
     assert "meta.segment_end" not in merged
+    assert "meta.speak_tail" not in merged
     assert "meta.tts_is_last_chunk" not in merged
     assert "meta.turn_end" not in merged
     assert merged.metadata["meta.stable_request_value"] == "keep"

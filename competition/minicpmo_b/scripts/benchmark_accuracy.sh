@@ -10,9 +10,12 @@ MODEL_PATH="${MODEL_PATH:-/workspace/MiniCPM-o-4_5}"
 RESULT_DIR="${RESULT_DIR:-${REPO_ROOT}/competition/minicpmo_b/results/accuracy/${SUITE}}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
 NUM_WARMUPS="${NUM_WARMUPS:-0}"
+BENCHMARK_SEED="${BENCHMARK_SEED:-0}"
 MIN_DAILY_OMNI_ACCURACY="${MIN_DAILY_OMNI_ACCURACY:-0.78}"
 MIN_VIDEOMME_ACCURACY="${MIN_VIDEOMME_ACCURACY:-0.68}"
 MAX_SEED_TTS_MEAN_WER="${MAX_SEED_TTS_MEAN_WER:-0.05}"
+MIN_SEED_TTS_MEAN_SIM="${MIN_SEED_TTS_MEAN_SIM:-}"
+MIN_SEED_TTS_MEAN_UTMOS="${MIN_SEED_TTS_MEAN_UTMOS:-}"
 DAILY_OMNI_ROOT="${DAILY_OMNI_ROOT:-/tmp/minicpmo_b_daily_omni}"
 VIDEOMME_ROOT="${VIDEOMME_ROOT:-/tmp/minicpmo_b_videomme}"
 SEED_TTS_ROOT="${SEED_TTS_ROOT:-/tmp/minicpmo_b_seedtts}"
@@ -32,13 +35,20 @@ common=(
   --served-model-name "${SERVED_MODEL_NAME}"
   --max-concurrency "${MAX_CONCURRENCY}"
   --num-warmups "${NUM_WARMUPS}"
+  --seed "${BENCHMARK_SEED}"
+  --require-complete-evaluation
   --result-dir "${RESULT_DIR}"
   --trust-remote-code
 )
 
 case "${SUITE}" in
   daily-omni)
-    NUM_PROMPTS="${NUM_PROMPTS:-1197}"
+    # Evaluate the complete prepared snapshot instead of assuming a stale
+    # published row count. The challenge mirror currently contains 1196 rows
+    # across ten parquet shards; another official snapshot may differ.
+    if [[ -z "${NUM_PROMPTS:-}" ]]; then
+      NUM_PROMPTS="$(python -c 'import json, sys; print(len(json.load(open(sys.argv[1], encoding="utf-8"))))' "${DAILY_OMNI_ROOT}/qa.json")"
+    fi
     exec "${common[@]}" \
       --num-prompts "${NUM_PROMPTS}" \
       --skip-seed-tts \
@@ -79,8 +89,15 @@ case "${SUITE}" in
     ;;
   seed-tts)
     NUM_PROMPTS="${NUM_PROMPTS:-1000}"
-    export SEED_TTS_SIM_EVAL=0
-    export SEED_TTS_UTMOS_EVAL=0
+    # Persist generated WAVs + an atomic manifest before the slow Whisper pass.
+    # An interrupted quality evaluation can then resume without the NPU service.
+    export SEED_TTS_WER_SAVE_AUDIO_DIR="${SEED_TTS_WER_SAVE_AUDIO_DIR:-${RESULT_DIR}/generated_audio_checkpoint}"
+    export SEED_TTS_PERF_CHECKPOINT_FILE="${SEED_TTS_PERF_CHECKPOINT_FILE:-${RESULT_DIR}/seed_tts_generation_performance_checkpoint.json}"
+    export SEED_TTS_SIM_EVAL="${SEED_TTS_SIM_EVAL:-0}"
+    export SEED_TTS_UTMOS_EVAL="${SEED_TTS_UTMOS_EVAL:-0}"
+    if [[ -z "${SEED_TTS_UTMOS_JIT_FILE:-}" && -f /workspace/utmos/utmos.jit ]]; then
+      export SEED_TTS_UTMOS_JIT_FILE=/workspace/utmos/utmos.jit
+    fi
     # Competition images are commonly network-isolated. Prefer the prepared
     # local Whisper checkpoint so an accuracy gate never blocks on a Hub
     # metadata request. An explicit SEED_TTS_HF_WHISPER_MODEL still wins.
@@ -88,6 +105,13 @@ case "${SUITE}" in
       export SEED_TTS_HF_WHISPER_MODEL="${LOCAL_WHISPER_MODEL}"
       export HF_HUB_OFFLINE=1
       export TRANSFORMERS_OFFLINE=1
+    fi
+    seed_quality_args=()
+    if [[ -n "${MIN_SEED_TTS_MEAN_SIM}" ]]; then
+      seed_quality_args+=(--min-seed-tts-mean-sim "${MIN_SEED_TTS_MEAN_SIM}")
+    fi
+    if [[ -n "${MIN_SEED_TTS_MEAN_UTMOS}" ]]; then
+      seed_quality_args+=(--min-seed-tts-mean-utmos "${MIN_SEED_TTS_MEAN_UTMOS}")
     fi
     exec "${common[@]}" \
       --num-prompts "${NUM_PROMPTS}" \
@@ -100,7 +124,8 @@ case "${SUITE}" in
       --seed-tts-eval-device "${SEED_TTS_EVAL_DEVICE:-cpu}" \
       --seed-extra-body-json '{"modalities":["text","audio"],"chat_template_kwargs":{"enable_thinking":false,"use_tts_template":true}}' \
       --temperature 0 \
-      --max-seed-tts-mean-wer "${MAX_SEED_TTS_MEAN_WER}"
+      --max-seed-tts-mean-wer "${MAX_SEED_TTS_MEAN_WER}" \
+      "${seed_quality_args[@]}"
     ;;
   *)
     echo "Unknown SUITE=${SUITE}; expected daily-omni, videomme, or seed-tts" >&2

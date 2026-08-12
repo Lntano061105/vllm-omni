@@ -8,13 +8,16 @@ import copy
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from vllm.logger import init_logger
 
 _SILENCE_TOKEN = 4218
+logger = init_logger(__name__)
 
 
 def _autocast_disabled(device: torch.device):
@@ -52,6 +55,20 @@ class PromptFeatures:
 class BatchedToken2WavState:
     flow_cache: dict[str, torch.Tensor]
     hift_cache: dict[str, torch.Tensor]
+
+
+@dataclass
+class _SteadyNPUGraph:
+    """Fixed-shape recurrent Token2Wav graph owned by one backend instance."""
+
+    graph: Any
+    tokens: torch.Tensor
+    features: PromptFeatures
+    input_state: BatchedToken2WavState
+    audio: torch.Tensor
+    output_state: BatchedToken2WavState
+    state_signature: tuple[Any, ...]
+    prompt_mel_length: int
 
 
 class BatchedToken2Wav(nn.Module):
@@ -213,6 +230,170 @@ class BatchedToken2Wav(nn.Module):
         )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
         self._initial_states: dict[tuple[str, str], BatchedToken2WavState] = {}
+        self._steady_npugraphs: dict[tuple[Any, ...], _SteadyNPUGraph] = {}
+        self._steady_npugraph_lock = Lock()
+        self.steady_npugraph_replays = 0
+        self.initial_state_cache_hits = 0
+
+    @property
+    def steady_npugraph_bucket_count(self) -> int:
+        return len(self._steady_npugraphs)
+
+    @staticmethod
+    def _clone_state(state: BatchedToken2WavState) -> BatchedToken2WavState:
+        return BatchedToken2WavState(
+            flow_cache={name: tensor.clone() for name, tensor in state.flow_cache.items()},
+            hift_cache={name: tensor.clone() for name, tensor in state.hift_cache.items()},
+        )
+
+    @staticmethod
+    def _copy_state_(
+        destination: BatchedToken2WavState,
+        source: BatchedToken2WavState,
+    ) -> None:
+        for cache_name in ("flow_cache", "hift_cache"):
+            destination_cache = getattr(destination, cache_name)
+            source_cache = getattr(source, cache_name)
+            if destination_cache.keys() != source_cache.keys():
+                raise RuntimeError(
+                    f"Token2Wav NPUGraph {cache_name} keys changed: "
+                    f"{sorted(destination_cache)} != {sorted(source_cache)}"
+                )
+            for name, destination_tensor in destination_cache.items():
+                source_tensor = source_cache[name]
+                if (
+                    destination_tensor.shape != source_tensor.shape
+                    or destination_tensor.dtype != source_tensor.dtype
+                    or destination_tensor.device != source_tensor.device
+                ):
+                    raise RuntimeError(
+                        f"Token2Wav NPUGraph {cache_name}.{name} layout changed: "
+                        f"{tensor_signature(destination_tensor)!r} != "
+                        f"{tensor_signature(source_tensor)!r}"
+                    )
+                destination_tensor.copy_(source_tensor)
+
+    def capture_steady_npugraph(
+        self,
+        tokens: torch.Tensor,
+        features: PromptFeatures,
+        state: BatchedToken2WavState,
+    ) -> None:
+        """Capture the exact-shape non-terminal single-stream decode path.
+
+        The graph owns all recurrent input and output buffers. Live dispatch
+        copies request state into those buffers and clones graph outputs back
+        to request-owned storage, so sequential requests cannot overwrite one
+        another. Shapes outside this one steady bucket retain eager execution.
+        """
+        if self.flow_device.type != "npu":
+            raise ValueError("steady Token2Wav NPUGraph requires an NPU device")
+        if int(tokens.shape[0]) != 1:
+            raise ValueError("steady Token2Wav NPUGraph only supports batch size 1")
+        graph_key = (
+            tensor_signature(tokens),
+            self._prompt_mel_length(features),
+            state_shape_signature(state),
+        )
+        if graph_key in self._steady_npugraphs:
+            return
+        static_tokens = tokens.detach().clone()
+        static_features = PromptFeatures(
+            speech_tokens=features.speech_tokens.detach().clone(),
+            projected_speaker_embedding=(
+                features.projected_speaker_embedding.detach().clone()
+            ),
+            mels=features.mels.detach().clone(),
+        )
+        static_state = self._clone_state(state)
+        pool = torch.npu.graph_pool_handle()
+        graph = torch.npu.NPUGraph()
+        with torch.inference_mode(), torch.npu.graph(graph, pool=pool):
+            audio_rows, output_states = self._decode_batch_eager(
+                static_tokens,
+                static_features,
+                [static_state],
+                last_chunk=False,
+            )
+        output_state = output_states[0]
+        input_signature = state_shape_signature(static_state)
+        output_signature = state_shape_signature(output_state)
+        if input_signature != output_signature:
+            raise RuntimeError(
+                "steady Token2Wav NPUGraph requires shape-stable recurrent "
+                f"state, got input={input_signature!r} output={output_signature!r}"
+            )
+        self._steady_npugraphs[graph_key] = _SteadyNPUGraph(
+            graph=graph,
+            tokens=static_tokens,
+            features=static_features,
+            input_state=static_state,
+            audio=audio_rows[0],
+            output_state=output_state,
+            state_signature=input_signature,
+            prompt_mel_length=self._prompt_mel_length(features),
+        )
+        logger.info(
+            "Captured steady MiniCPM-o Token2Wav NPUGraph bucket: "
+            "tokens=%s prompt_mels=%d state=%s",
+            tensor_signature(tokens),
+            self._prompt_mel_length(features),
+            input_signature,
+        )
+
+    def _decode_batch_npugraph(
+        self,
+        tokens: torch.Tensor,
+        features: PromptFeatures | Sequence[PromptFeatures],
+        states: list[BatchedToken2WavState],
+        *,
+        last_chunk: bool,
+        flush_encoder: bool,
+    ) -> tuple[list[torch.Tensor], list[BatchedToken2WavState]] | None:
+        if len(states) != 1 or not isinstance(features, PromptFeatures):
+            return None
+        graph_key = (
+            tensor_signature(tokens),
+            self._prompt_mel_length(features),
+            state_shape_signature(states[0]),
+        )
+        captured = self._steady_npugraphs.get(graph_key)
+        if (
+            captured is None
+            or last_chunk
+            or flush_encoder
+            or tokens.shape != captured.tokens.shape
+            or tokens.dtype != captured.tokens.dtype
+            or tokens.device != captured.tokens.device
+            or self._prompt_mel_length(features) != captured.prompt_mel_length
+            or state_shape_signature(states[0]) != captured.state_signature
+        ):
+            return None
+
+        with self._steady_npugraph_lock:
+            captured.tokens.copy_(tokens)
+            captured.features.speech_tokens.copy_(features.speech_tokens)
+            captured.features.projected_speaker_embedding.copy_(
+                features.projected_speaker_embedding
+            )
+            captured.features.mels.copy_(features.mels)
+            self._copy_state_(captured.input_state, states[0])
+            captured.graph.replay()
+            # The graph reuses its outputs on every replay. Clone them before
+            # releasing the host lock so request state and connector audio stay
+            # valid when the next stream reuses the graph buffers.
+            audio = captured.audio.detach().clone()
+            next_state = self._clone_state(captured.output_state)
+            torch.accelerator.synchronize(self.flow_device)
+            self.steady_npugraph_replays += 1
+            if self.steady_npugraph_replays == 1:
+                logger.info(
+                    "Replayed steady MiniCPM-o Token2Wav NPUGraph: "
+                    "tokens=%s prompt_mels=%d",
+                    tensor_signature(tokens),
+                    captured.prompt_mel_length,
+                )
+        return [audio], [next_state]
 
     def bucket_prompt_features(
         self,
@@ -324,6 +505,16 @@ class BatchedToken2Wav(nn.Module):
         if template is None:
             template = self.setup_batch(features, 1)[0]
             self._initial_states[cache_key] = template
+            logger.info(
+                "Cached MiniCPM-o Token2Wav immutable initial state: prompt=%s",
+                prompt_cache_id,
+            )
+        else:
+            self.initial_state_cache_hits += 1
+            if self.initial_state_cache_hits == 1:
+                logger.info(
+                    "Reused MiniCPM-o Token2Wav immutable initial state"
+                )
         return features, [template] * batch_size
 
     @staticmethod
@@ -788,6 +979,32 @@ class BatchedToken2Wav(nn.Module):
         return result
 
     def decode_batch(
+        self,
+        tokens: torch.Tensor,
+        features: PromptFeatures | Sequence[PromptFeatures],
+        states: list[BatchedToken2WavState],
+        *,
+        last_chunk: bool,
+        flush_encoder: bool = False,
+    ) -> tuple[list[torch.Tensor], list[BatchedToken2WavState]]:
+        graph_result = self._decode_batch_npugraph(
+            tokens,
+            features,
+            states,
+            last_chunk=last_chunk,
+            flush_encoder=flush_encoder,
+        )
+        if graph_result is not None:
+            return graph_result
+        return self._decode_batch_eager(
+            tokens,
+            features,
+            states,
+            last_chunk=last_chunk,
+            flush_encoder=flush_encoder,
+        )
+
+    def _decode_batch_eager(
         self,
         tokens: torch.Tensor,
         features: PromptFeatures | Sequence[PromptFeatures],

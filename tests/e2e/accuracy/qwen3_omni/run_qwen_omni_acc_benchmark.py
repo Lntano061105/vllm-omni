@@ -85,6 +85,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import os
 import sys
 from datetime import datetime
@@ -112,29 +113,92 @@ def _default_result_dir() -> Path:
     return Path(__file__).resolve().parent / "results" / "qwen_omni_acc"
 
 
-def _validate_daily_omni(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
+def _validate_request_completion(
+    result: dict[str, Any], *, expected_requests: int
+) -> list[str]:
+    errs: list[str] = []
+    completed = int(result.get("completed", 0) or 0)
+    failed = int(result.get("failed", 0) or 0)
+    if completed != expected_requests:
+        errs.append(f"completed={completed} != expected {expected_requests}")
+    if failed != 0:
+        errs.append(f"failed={failed} != 0")
+    return errs
+
+
+def _validate_daily_omni(
+    result: dict[str, Any],
+    *,
+    min_accuracy: float | None,
+    expected_requests: int | None = None,
+) -> list[str]:
     errs: list[str] = []
     acc = result.get("daily_omni_accuracy")
     if acc is None:
         errs.append("Missing daily_omni_accuracy (wrong dataset or no gold-evaluated rows).")
         return errs
+    if not math.isfinite(float(acc)):
+        errs.append(f"daily_omni_accuracy is non-finite: {acc!r}")
+        return errs
     ev = int(result.get("daily_omni_evaluated_ok", 0) or 0)
     if ev <= 0:
         errs.append("daily_omni_evaluated_ok is 0; no successful MCQ rows to score.")
+    if expected_requests is not None:
+        errs.extend(
+            _validate_request_completion(
+                result, expected_requests=expected_requests
+            )
+        )
+        evaluated = int(result.get("daily_omni_evaluated", 0) or 0)
+        if evaluated != expected_requests:
+            errs.append(
+                f"daily_omni_evaluated={evaluated} != expected {expected_requests}"
+            )
+        if ev != expected_requests:
+            errs.append(
+                f"daily_omni_evaluated_ok={ev} != expected {expected_requests}"
+            )
+        for key in ("daily_omni_request_failed", "daily_omni_parse_failed"):
+            value = int(result.get(key, 0) or 0)
+            if value != 0:
+                errs.append(f"{key}={value} != 0")
     if min_accuracy is not None and float(acc) + 1e-12 < float(min_accuracy):
         errs.append(f"daily_omni_accuracy={acc:.6f} < --min-daily-omni-accuracy={min_accuracy}")
     return errs
 
 
-def _validate_videomme(result: dict[str, Any], *, min_accuracy: float | None) -> list[str]:
+def _validate_videomme(
+    result: dict[str, Any],
+    *,
+    min_accuracy: float | None,
+    expected_requests: int | None = None,
+) -> list[str]:
     errs: list[str] = []
     acc = result.get("videomme_accuracy")
     if acc is None:
         errs.append("Missing videomme_accuracy (wrong dataset or no gold-evaluated rows).")
         return errs
+    if not math.isfinite(float(acc)):
+        errs.append(f"videomme_accuracy is non-finite: {acc!r}")
+        return errs
     ev = int(result.get("videomme_evaluated_ok", 0) or 0)
     if ev <= 0:
         errs.append("videomme_evaluated_ok is 0; no successful MCQ rows to score.")
+    if expected_requests is not None:
+        errs.extend(
+            _validate_request_completion(
+                result, expected_requests=expected_requests
+            )
+        )
+        evaluated = int(result.get("videomme_evaluated", 0) or 0)
+        if evaluated != expected_requests:
+            errs.append(f"videomme_evaluated={evaluated} != expected {expected_requests}")
+        if ev != expected_requests:
+            errs.append(f"videomme_evaluated_ok={ev} != expected {expected_requests}")
+        for key in ("videomme_request_failed", "videomme_parse_failed"):
+            value = int(result.get(key, 0) or 0)
+            if value != 0:
+                errs.append(f"{key}={value} != 0")
     if min_accuracy is not None and float(acc) + 1e-12 < float(min_accuracy):
         errs.append(f"videomme_accuracy={acc:.6f} < --min-videomme-accuracy={min_accuracy}")
     return errs
@@ -146,6 +210,8 @@ def _validate_seed_tts(
     max_mean_wer: float | None,
     min_mean_sim: float | None,
     min_mean_utmos: float | None,
+    expected_requests: int | None = None,
+    expected_turns: int | None = None,
 ) -> list[str]:
     errs: list[str] = []
     setup = result.get("seed_tts_eval_setup_error")
@@ -155,15 +221,74 @@ def _validate_seed_tts(
     n = int(result.get("seed_tts_content_evaluated", 0) or 0)
     if n <= 0:
         errs.append("seed_tts_content_evaluated is 0 (enable --seed-tts-wer-eval and check PCM capture).")
+    if expected_requests is not None:
+        errs.extend(
+            _validate_request_completion(
+                result, expected_requests=expected_requests
+            )
+        )
+        session_count = int(result.get("seed_tts_session_count", 0) or 0)
+        if session_count != expected_requests:
+            errs.append(
+                f"seed_tts_session_count={session_count} != expected {expected_requests}"
+            )
+    if expected_turns is not None and n != expected_turns:
+        errs.append(f"seed_tts_content_evaluated={n} != expected {expected_turns}")
+    if expected_turns is not None:
+        turn_count = int(result.get("seed_tts_turn_count", 0) or 0)
+        if turn_count != expected_turns:
+            errs.append(f"seed_tts_turn_count={turn_count} != expected {expected_turns}")
+    for key in (
+        "seed_tts_request_failed",
+        "seed_tts_asr_failed",
+        "seed_tts_no_pcm",
+        "seed_tts_save_audio_failed",
+    ):
+        value = int(result.get(key, 0) or 0)
+        if expected_requests is not None and value != 0:
+            errs.append(f"{key}={value} != 0")
     mean_wer = result.get("seed_tts_content_error_mean")
-    if mean_wer is not None and max_mean_wer is not None and float(mean_wer) > float(max_mean_wer) + 1e-12:
+    if mean_wer is not None and not math.isfinite(float(mean_wer)):
+        errs.append(f"seed_tts_content_error_mean is non-finite: {mean_wer!r}")
+    elif mean_wer is not None and max_mean_wer is not None and float(mean_wer) > float(max_mean_wer) + 1e-12:
         errs.append(f"seed_tts_content_error_mean (WER)={mean_wer:.6f} > --max-seed-tts-mean-wer={max_mean_wer}")
     sim_m = result.get("seed_tts_sim_mean")
-    if sim_m is not None and min_mean_sim is not None and float(sim_m) + 1e-12 < float(min_mean_sim):
-        errs.append(f"seed_tts_sim_mean={sim_m:.6f} < --min-seed-tts-mean-sim={min_mean_sim}")
+    if min_mean_sim is not None:
+        if sim_m is None:
+            errs.append("Missing seed_tts_sim_mean while --min-seed-tts-mean-sim is set")
+        elif not math.isfinite(float(sim_m)):
+            errs.append(f"seed_tts_sim_mean is non-finite: {sim_m!r}")
+        else:
+            if float(sim_m) + 1e-12 < float(min_mean_sim):
+                errs.append(f"seed_tts_sim_mean={sim_m:.6f} < --min-seed-tts-mean-sim={min_mean_sim}")
+        if expected_turns is not None:
+            sim_evaluated = int(result.get("seed_tts_sim_evaluated", 0) or 0)
+            if sim_evaluated != expected_turns:
+                errs.append(
+                    f"seed_tts_sim_evaluated={sim_evaluated} != expected {expected_turns}"
+                )
+            for key in ("seed_tts_sim_failed", "seed_tts_sim_skipped_no_ref"):
+                value = int(result.get(key, 0) or 0)
+                if value != 0:
+                    errs.append(f"{key}={value} != 0")
     ut_m = result.get("seed_tts_utmos_mean")
-    if ut_m is not None and min_mean_utmos is not None and float(ut_m) + 1e-12 < float(min_mean_utmos):
-        errs.append(f"seed_tts_utmos_mean={ut_m:.6f} < --min-seed-tts-mean-utmos={min_mean_utmos}")
+    if min_mean_utmos is not None:
+        if ut_m is None:
+            errs.append("Missing seed_tts_utmos_mean while --min-seed-tts-mean-utmos is set")
+        elif not math.isfinite(float(ut_m)):
+            errs.append(f"seed_tts_utmos_mean is non-finite: {ut_m!r}")
+        else:
+            if float(ut_m) + 1e-12 < float(min_mean_utmos):
+                errs.append(f"seed_tts_utmos_mean={ut_m:.6f} < --min-seed-tts-mean-utmos={min_mean_utmos}")
+        if expected_turns is not None:
+            utmos_evaluated = int(result.get("seed_tts_utmos_evaluated", 0) or 0)
+            if utmos_evaluated != expected_turns:
+                errs.append(
+                    f"seed_tts_utmos_evaluated={utmos_evaluated} != expected {expected_turns}"
+                )
+            value = int(result.get("seed_tts_utmos_failed", 0) or 0)
+            if value != 0:
+                errs.append(f"seed_tts_utmos_failed={value} != 0")
     return errs
 
 
@@ -244,6 +369,7 @@ def _build_common_args(
         endpoint=endpoint,
         temperature=getattr(ns, "temperature", None),
         output_len=getattr(ns, "output_len", None),
+        seed=getattr(ns, "seed", 0),
     )
 
 
@@ -354,6 +480,12 @@ def run_seed_tts(ns: argparse.Namespace, vllm: str) -> Path:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--host", default=os.environ.get("ACC_BENCH_HOST", "127.0.0.1"))
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=int(os.environ.get("ACC_BENCH_SEED", "0")),
+        help="Deterministic dataset shuffle seed forwarded to vllm bench serve.",
+    )
     p.add_argument("--port", type=int, default=int(os.environ.get("ACC_BENCH_PORT", "8000")))
     p.add_argument(
         "--model",
@@ -371,6 +503,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-prompts", type=int, default=int(os.environ.get("ACC_BENCH_NUM_PROMPTS", "2000")))
     p.add_argument("--max-concurrency", type=int, default=int(os.environ.get("ACC_BENCH_MAX_CONCURRENCY", "10")))
     p.add_argument("--num-warmups", type=int, default=int(os.environ.get("ACC_BENCH_NUM_WARMUPS", "0")))
+    p.add_argument(
+        "--require-complete-evaluation",
+        action="store_true",
+        help="Fail unless every requested item completes and is successfully evaluated.",
+    )
     p.add_argument(
         "--percentile-metrics",
         default=os.environ.get("ACC_BENCH_PERCENTILE_METRICS", "ttft,tpot,itl,e2el,audio_ttfp,audio_rtf"),
@@ -631,7 +768,13 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_daily_omni(ns, vllm)
             print(f"\n[Daily-Omni] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
-            errs = _validate_daily_omni(data, min_accuracy=ns.min_daily_omni_accuracy)
+            errs = _validate_daily_omni(
+                data,
+                min_accuracy=ns.min_daily_omni_accuracy,
+                expected_requests=ns.num_prompts
+                if ns.require_complete_evaluation
+                else None,
+            )
             if errs:
                 failed.extend([f"[Daily-Omni] {e}" for e in errs])
             else:
@@ -645,7 +788,13 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
             path = run_videomme(ns, vllm)
             print(f"\n[Video-MME] result JSON: {path}", flush=True)
             data = load_benchmark_result(path)
-            errs = _validate_videomme(data, min_accuracy=ns.min_videomme_accuracy)
+            errs = _validate_videomme(
+                data,
+                min_accuracy=ns.min_videomme_accuracy,
+                expected_requests=ns.num_prompts
+                if ns.require_complete_evaluation
+                else None,
+            )
             if errs:
                 failed.extend([f"[Video-MME] {e}" for e in errs])
             else:
@@ -665,8 +814,14 @@ def run_acc_benchmark(ns: argparse.Namespace) -> int:
                 max_mean_wer=ns.max_seed_tts_mean_wer,
                 min_mean_sim=ns.min_seed_tts_mean_sim,
                 min_mean_utmos=ns.min_seed_tts_mean_utmos,
+                expected_requests=ns.num_prompts
+                if ns.require_complete_evaluation
+                else None,
+                expected_turns=ns.num_prompts * ns.seed_tts_turns_per_session
+                if ns.require_complete_evaluation
+                else None,
             )
-            if ns.seed_tts_turns_per_session > 1:
+            if ns.seed_tts_turns_per_session > 1 and not ns.require_complete_evaluation:
                 expected_turns = ns.num_prompts * ns.seed_tts_turns_per_session
                 evaluated_turns = int(data.get("seed_tts_content_evaluated") or 0)
                 if evaluated_turns != expected_turns:

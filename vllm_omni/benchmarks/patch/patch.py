@@ -2105,22 +2105,6 @@ async def benchmark(
         result.update(_vm_acc)
         print_videomme_accuracy_summary(_vm_acc)
 
-    if _seed_tts_capture_pcm_for_wer():
-        from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
-            compute_seed_tts_wer_metrics,
-            print_seed_tts_wer_summary,
-        )
-
-        _save_wer = os.environ.get("SEED_TTS_WER_SAVE_ITEMS", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        _wer_m = compute_seed_tts_wer_metrics(input_requests, outputs, include_per_item=_save_wer)
-        if _wer_m is not None:
-            result.update(_wer_m)
-            print_seed_tts_wer_summary(_wer_m)
-
     if rps_change_events:
         result["rps_change_events"] = rps_change_events
 
@@ -2180,6 +2164,48 @@ async def benchmark(
     else:
         result_percentile_metrics.append("e2el")
         process_one_metric("e2el")
+
+    if _seed_tts_capture_pcm_for_wer():
+        checkpoint_raw = os.environ.get("SEED_TTS_PERF_CHECKPOINT_FILE", "").strip()
+        if checkpoint_raw:
+            checkpoint_path = Path(checkpoint_raw).expanduser()
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_result = {
+                **result,
+                "seed_tts_generation_checkpoint": True,
+                "seed_tts_quality_complete": False,
+            }
+            checkpoint_tmp = checkpoint_path.with_name(
+                f".{checkpoint_path.name}.tmp-{os.getpid()}"
+            )
+            with checkpoint_tmp.open("w", encoding="utf-8") as checkpoint_file:
+                json.dump(checkpoint_result, checkpoint_file, ensure_ascii=False)
+                checkpoint_file.flush()
+                os.fsync(checkpoint_file.fileno())
+            os.replace(checkpoint_tmp, checkpoint_path)
+            print(
+                "Saved Seed-TTS generation/performance checkpoint to "
+                f"{checkpoint_path}",
+                flush=True,
+            )
+
+        from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
+            compute_seed_tts_wer_metrics,
+            print_seed_tts_wer_summary,
+        )
+
+        _save_wer = os.environ.get("SEED_TTS_WER_SAVE_ITEMS", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        _wer_m = compute_seed_tts_wer_metrics(input_requests, outputs, include_per_item=_save_wer)
+        if _wer_m is not None:
+            result.update(_wer_m)
+            result["seed_tts_quality_complete"] = not bool(
+                _wer_m.get("seed_tts_eval_setup_error")
+            )
+            print_seed_tts_wer_summary(_wer_m)
 
     if profile:
         print("Stopping profiler...")

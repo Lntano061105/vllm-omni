@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import time
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from pathlib import Path
 from threading import Lock
 from typing import Any
 
 import numpy as np
+from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import MiniCPMO45DuplexPolicy
 
 _MINICPMO45_SPECIAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS
 _MINICPMO45_OPTIONAL_TOKEN_FIELDS = MiniCPMO45DuplexPolicy.OPTIONAL_TOKEN_FIELDS
 _MINICPMO45_PROCESSOR_LOAD_LOCK = Lock()
+logger = init_logger(__name__)
 
 
 @dataclass
@@ -58,6 +63,32 @@ class MiniCPMO45Stage0DuplexRuntime:
             if self.processor is not None
             else getattr(stage_model, "tokenizer", None)
         )
+        connector = getattr(
+            getattr(getattr(stage_model, "vllm_config", None), "model_config", None),
+            "stage_connector_config",
+            None,
+        )
+        if isinstance(connector, Mapping):
+            extra = connector.get("extra", connector)
+        else:
+            extra = getattr(connector, "extra", None)
+        extra = extra if isinstance(extra, Mapping) else {}
+        runtime_config = getattr(
+            getattr(stage_model, "config", None),
+            "minicpmo45_runtime_config",
+            None,
+        )
+        runtime_config = runtime_config if isinstance(runtime_config, Mapping) else {}
+        self._ref_audio_embedding_cache_size = int(
+            runtime_config.get(
+                "stage0_ref_audio_embedding_cache_size",
+                extra.get("stage0_ref_audio_embedding_cache_size", 0),
+            )
+        )
+        if self._ref_audio_embedding_cache_size < 0:
+            raise ValueError("stage0_ref_audio_embedding_cache_size must be >= 0")
+        self._ref_audio_embedding_cache: dict[str, Any] = {}
+        self.ref_audio_embedding_cache_hits = 0
         self._init_token_ids()
         if self.tokenizer is not None:
             self._require_special_token_ids()
@@ -495,6 +526,123 @@ class MiniCPMO45Stage0DuplexRuntime:
         return decode_native_ref_audio_from_config({"extra_body": session_config})
 
     def _stage_ref_audio_embeddings(
+        self,
+        ref_audio: Any,
+        *,
+        state: _MiniCPMO45Stage0SessionState | None = None,
+    ) -> Any | None:
+        cache_size = int(getattr(self, "_ref_audio_embedding_cache_size", 0))
+        if cache_size == 0 or not self._can_cache_stage_ref_audio_embeddings():
+            return self._compute_stage_ref_audio_embeddings(ref_audio, state=state)
+        cache = getattr(self, "_ref_audio_embedding_cache", None)
+        if cache is None:
+            cache = self._ref_audio_embedding_cache = {}
+        cache_key = self._ref_audio_embedding_cache_key(ref_audio)
+        cached = cache.get(cache_key)
+        if cached is not None:
+            cache[cache_key] = cache.pop(cache_key)
+            self.ref_audio_embedding_cache_hits = int(
+                getattr(self, "ref_audio_embedding_cache_hits", 0)
+            ) + 1
+            if self.ref_audio_embedding_cache_hits == 1:
+                logger.info(
+                    "Reused MiniCPM-o Stage-0 reference audio embedding cache"
+                )
+            return cached
+
+        result = self._compute_stage_ref_audio_embeddings(ref_audio, state=state)
+        if result is None:
+            return result
+        detach = getattr(result, "detach", None)
+        cached_result = detach() if callable(detach) else result
+        cache[cache_key] = cached_result
+        logger.info(
+            "Cached MiniCPM-o Stage-0 reference audio embedding: entries=%d limit=%d",
+            len(cache),
+            cache_size,
+        )
+        while len(cache) > cache_size:
+            cache.pop(next(iter(cache)))
+        return cached_result
+
+    def preload_ref_audio_embeddings(
+        self,
+        prompt_wavs: Any,
+        *,
+        target_sample_rate: int = 16000,
+        frame_samples: int = 1600,
+    ) -> None:
+        """Populate and compile the immutable Stage-0 voice prompt cache."""
+        if isinstance(prompt_wavs, (str, Path)):
+            prompt_wavs = [prompt_wavs]
+        if not isinstance(prompt_wavs, (list, tuple)):
+            raise ValueError("stage0_ref_audio_embedding_preload_wavs must be a path list")
+        if prompt_wavs and self._ref_audio_embedding_cache_size == 0:
+            raise ValueError(
+                "stage0_ref_audio_embedding_preload_wavs requires "
+                "stage0_ref_audio_embedding_cache_size > 0"
+            )
+        if target_sample_rate <= 0 or frame_samples < 0:
+            raise ValueError("invalid Stage-0 reference preload sample configuration")
+
+        import soundfile as sf
+        import torch
+
+        from vllm_omni.experimental.fullduplex.minicpmo45.adapter import (
+            MiniCPMO45NativeDuplexServingAdapter,
+        )
+
+        for raw_path in prompt_wavs:
+            prompt_path = Path(str(raw_path))
+            if not prompt_path.is_absolute():
+                prompt_path = Path(str(self.model_path)) / prompt_path
+            if not prompt_path.is_file():
+                raise FileNotFoundError(
+                    f"MiniCPM-o Stage-0 reference preload not found: {prompt_path}"
+                )
+            waveform, sample_rate = sf.read(
+                str(prompt_path),
+                dtype="float32",
+                always_2d=False,
+            )
+            waveform = MiniCPMO45NativeDuplexServingAdapter.normalize_ref_audio(
+                np.asarray(waveform, dtype=np.float32),
+                int(sample_rate),
+                target_sr=target_sample_rate,
+            )
+            if frame_samples > 0:
+                usable = (len(waveform) // frame_samples) * frame_samples
+                waveform = waveform[:usable]
+            with torch.inference_mode():
+                self._stage_ref_audio_embeddings(waveform)
+            logger.info(
+                "Preloaded MiniCPM-o Stage-0 reference audio embedding: "
+                "source=%s samples=%d sample_rate=%d",
+                prompt_path,
+                len(waveform),
+                target_sample_rate,
+            )
+        if prompt_wavs and not str(getattr(self, "device", "cpu")).startswith("cpu"):
+            torch.accelerator.synchronize()
+
+    def _can_cache_stage_ref_audio_embeddings(self) -> bool:
+        if not callable(getattr(self.processor, "process_audio", None)):
+            return False
+        return any(
+            callable(getattr(target, name, None))
+            for target in (self.stage_model, self.thinker)
+            for name in ("get_audio_embedding", "get_audio_hidden_states")
+        )
+
+    @staticmethod
+    def _ref_audio_embedding_cache_key(ref_audio: Any) -> str:
+        waveform = np.ascontiguousarray(np.asarray(ref_audio, dtype=np.float32).reshape(-1))
+        digest = hashlib.sha256()
+        digest.update(waveform.tobytes())
+        digest.update(str(tuple(waveform.shape)).encode())
+        return digest.hexdigest()
+
+    def _compute_stage_ref_audio_embeddings(
         self,
         ref_audio: Any,
         *,

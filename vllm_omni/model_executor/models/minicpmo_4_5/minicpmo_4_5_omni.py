@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from contextlib import suppress
 from functools import cached_property
 from typing import Any
@@ -730,14 +730,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         if chunk_eos_id >= 0 and chunk_eos_id < logits.shape[-1]:
-            max_speak_tokens = int(
-                getattr(
-                    self,
-                    "max_new_speak_tokens_per_chunk",
-                    MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK,
-                )
-                or MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK
-            )
+            max_speak_tokens = MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK
             request_max_tokens = self._minicpmo45_duplex_row_request_max_tokens(row_idx)
             effective_max_speak_tokens = max_speak_tokens
             if request_max_tokens is not None:
@@ -1099,5 +1092,29 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             talker_loaded = self.talker.load_weights(talker_weights)
             talker_loaded = add_prefix_to_loaded_weights(talker_loaded, "talker")
             loaded_weights.update(talker_loaded)
+
+        if self.thinker is not None:
+            runtime_config = getattr(self.config, "minicpmo45_runtime_config", None)
+            runtime_config = runtime_config if isinstance(runtime_config, Mapping) else {}
+            preload_wavs = runtime_config.get(
+                "stage0_ref_audio_embedding_preload_wavs",
+                [],
+            )
+            if preload_wavs:
+                self._duplex_data_plane_helper().preload_ref_audio_embeddings(
+                    preload_wavs,
+                    target_sample_rate=int(
+                        runtime_config.get(
+                            "stage0_ref_audio_embedding_preload_sample_rate",
+                            16000,
+                        )
+                    ),
+                    frame_samples=int(
+                        runtime_config.get(
+                            "stage0_ref_audio_embedding_preload_frame_samples",
+                            1600,
+                        )
+                    ),
+                )
 
         return loaded_weights

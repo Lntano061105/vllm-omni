@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 from pathlib import Path
 
@@ -45,6 +47,7 @@ def main() -> int:
         nargs="+",
         help="JSON path or LABEL=JSON_PATH; the first case is the delta baseline",
     )
+    parser.add_argument("--output", type=Path, help="Also write the Markdown table here.")
     args = parser.parse_args()
 
     cases: list[tuple[str, dict[str, object]]] = []
@@ -52,22 +55,30 @@ def main() -> int:
         label, path = parse_case(raw)
         cases.append((label, json.loads(path.read_text(encoding="utf-8"))))
 
-    labels = [label for label, _ in cases]
-    print("| Metric | " + " | ".join(labels) + " | " + " | ".join(f"{label} vs {labels[0]}" for label in labels[1:]) + " |")
-    print("|---|" + "---:|" * (len(labels) * 2 - 1))
-    baseline = cases[0][1]
-    for key, title, higher_is_better in METRICS:
-        values = [data.get(key) for _, data in cases]
-        deltas: list[str] = []
-        base_value = baseline.get(key)
-        for value in values[1:]:
-            if not isinstance(base_value, (int, float)) or not isinstance(value, (int, float)) or base_value == 0:
-                deltas.append("N/A")
-                continue
-            raw_delta = (float(value) / float(base_value) - 1.0) * 100.0
-            score_delta = raw_delta if higher_is_better else -raw_delta
-            deltas.append(f"{raw_delta:+.2f}% ({score_delta:+.2f}% score)")
-        print("| " + title + " | " + " | ".join(display(value) for value in values) + " | " + " | ".join(deltas) + " |")
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream):
+        labels = [label for label, _ in cases]
+        print("| Metric | " + " | ".join(labels) + " | " + " | ".join(f"{label} vs {labels[0]}" for label in labels[1:]) + " |")
+        print("|---|" + "---:|" * (len(labels) * 2 - 1))
+        baseline = cases[0][1]
+        for key, title, higher_is_better in METRICS:
+            values = [data.get(key) for _, data in cases]
+            deltas: list[str] = []
+            base_value = baseline.get(key)
+            for value in values[1:]:
+                if not isinstance(base_value, (int, float)) or not isinstance(value, (int, float)) or base_value == 0:
+                    deltas.append("N/A")
+                    continue
+                raw_delta = (float(value) / float(base_value) - 1.0) * 100.0
+                score_delta = raw_delta if higher_is_better else -raw_delta
+                deltas.append(f"{raw_delta:+.2f}% ({score_delta:+.2f}% score)")
+            print("| " + title + " | " + " | ".join(display(value) for value in values) + " | " + " | ".join(deltas) + " |")
+
+    rendered = stream.getvalue()
+    print(rendered, end="")
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered, encoding="utf-8")
 
     return 0
 

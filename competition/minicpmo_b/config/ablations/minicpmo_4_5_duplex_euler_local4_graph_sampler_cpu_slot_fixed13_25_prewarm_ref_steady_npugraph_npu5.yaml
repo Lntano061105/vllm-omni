@@ -1,0 +1,44 @@
+# Stage-2 steady Token2Wav NPUGraph ablation on top of the validated physical
+# NPU-5 candidate. Capture is limited to batch-1, non-terminal, shape-stable
+# 28-token packets (3 left-context + 25 new codec frames). Initial, terminal,
+# batched, and unmatched reference-prompt shapes retain the eager path.
+base_config: minicpmo_4_5_duplex_euler_local4_graph_sampler_cpu_slot_fixed13_25_prewarm_ref_npu5.yaml
+
+# ``connectors`` is a top-level replace-on-overlay field, so keep the complete
+# validated connector block and add only the NPUGraph-specific switches.
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      code2wav_cache_initial_state: true
+      code2wav_cross_prompt_batching: true
+      code2wav_runtime_prompt_cache_size: 4
+      code2wav_cache_runtime_initial_state: true
+      code2wav_runtime_prompt_preload_wavs:
+        - assets/system_ref_audio.wav
+      code2wav_runtime_prompt_preload_sample_rate: 16000
+      code2wav_runtime_prompt_preload_frame_samples: 1600
+      code2wav_prewarm: true
+      code2wav_runner_prewarm: true
+      token2wav_cfg_mode: conditional
+      token2wav_solver: euler
+      token2wav_n_timesteps: 1
+      token2wav_remove_hift_weight_norm: true
+      token2wav_steady_npugraph: true
+      code2wav_npugraph_prompt_wavs:
+        - assets/system_ref_audio.wav
+      code2wav_npugraph_prompt_sample_rate: 16000
+      code2wav_npugraph_prompt_frame_samples: 1600
+      talker_emit_codec_chunks: true
+      initial_codec_chunk_frames: 13
+      codec_chunk_frames: 25
+      codec_left_context_frames: 3
+      talker_local_decode_stage_id: 1
+      talker_local_decode_steps: 4
+      talker_local_cpu_slot_mapping: true
+      talker_graph_sampler: true
+      talker_binary_argmax: true
+      talker_fixed_nonfinal_codec_chunks: true

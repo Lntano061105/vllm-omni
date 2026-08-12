@@ -40,6 +40,9 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
             apply_model_patches(self.model_config)
         NPUModelRunner.load_model(self, *args, **kwargs)
+        runner_prewarm = getattr(self.model, "runner_prewarm", None)
+        if callable(runner_prewarm):
+            runner_prewarm()
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
@@ -304,11 +307,40 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                     )
                     self.compilation_config.cache_dir = None
                 # Call self.model() directly (like GPU) to avoid make_omni_output during dummy_run
+                dummy_model_kwargs = {}
+                talker = getattr(self.model, "talker", None)
+                if getattr(talker, "_talker_graph_head", False):
+                    # FULL decode rows are packed contiguously. Capture a
+                    # static prefix slice instead of a dynamic gather so the
+                    # graph contains no index-driven MTE address calculation.
+                    dummy_model_kwargs["omni_num_sample_rows"] = num_reqs_padded
+                if getattr(talker, "_talker_graph_sampler", False):
+                    # FULL graph capture must take the same Python branch and
+                    # expose the same tensor inputs as runtime replay.  These
+                    # must be views of the runner-owned persistent buffers,
+                    # rather than temporary capture tensors: ACLGraph records
+                    # the physical addresses used by kwargs, and replaying an
+                    # address belonging to a freed dummy tensor causes an MTE
+                    # DDR out-of-range fault on the first decode invocation.
+                    history = getattr(self, "talker_codec_history", None)
+                    eos_allowed = getattr(self, "talker_codec_eos_allowed", None)
+                    if history is None or eos_allowed is None:
+                        raise RuntimeError(
+                            "Talker graph sampler capture requires persistent "
+                            "runner history and EOS buffers"
+                        )
+                    dummy_model_kwargs["omni_codec_history"] = history.gpu[
+                        :num_reqs_padded
+                    ]
+                    dummy_model_kwargs["omni_codec_eos_allowed"] = eos_allowed.gpu[
+                        :num_reqs_padded
+                    ]
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
                     intermediate_tensors=intermediate_tensors,
                     inputs_embeds=inputs_embeds,
+                    **dummy_model_kwargs,
                 )
                 # ---------------------------------------Omni-new----------------------------------------------
             if self.use_aux_hidden_state_outputs:

@@ -33,6 +33,8 @@ class MiniCPMO45DataPlaneContext:
 @dataclass(slots=True)
 class _TurnState:
     sent_segment_text: str = ""
+    last_segment_text: str = ""
+    pending_text_without_audio: list[str] = field(default_factory=list)
     has_text: bool = False
     tts_eos_done: bool = False
     turn_eos_done: bool = False
@@ -223,7 +225,17 @@ class MiniCPMO45DataPlaneSession:
             )
         )
         stage_turn_end = _bool_metadata(mm_output, ("turn_end", "end_of_turn"), default=False)
-        speak_tail = _bool_metadata(mm_output, ("speak_tail",), default=False)
+        # A turn-ending Code2Wav packet is unambiguously produced after the
+        # Thinker has handed off <turn_eos>, so it belongs to SPEAK tail even
+        # if an older runner/connector drops the newer speak_tail metadata.
+        # Keep the explicit flag authoritative for earlier draining packets,
+        # while preventing the final tail packet from being misclassified as
+        # SPEAK generation by the competition benchmark.
+        speak_tail = stage_turn_end or _bool_metadata(
+            mm_output,
+            ("speak_tail",),
+            default=False,
+        )
         terminal_turn_state = request_state.turn(output_turn_id) if request_state is not None else None
         stage_tts_eos = (
             context.auto_responds
@@ -248,7 +260,19 @@ class MiniCPMO45DataPlaneSession:
         text_turn_id = output_turn_id if output_turn_id is not None else context.turn_id
         text_turn_state = request_state.turn(text_turn_id) if request_state is not None else None
         if audio_chunks:
-            delta_text = self.segment_text_delta(request_id, text, turn_id=text_turn_id)
+            audio_text = text
+            if text_turn_state is not None and text_turn_state.pending_text_without_audio:
+                pending_text = "".join(text_turn_state.pending_text_without_audio)
+                text_turn_state.pending_text_without_audio.clear()
+                if not audio_text:
+                    audio_text = pending_text
+                elif audio_text == pending_text or audio_text.startswith(pending_text):
+                    pass
+                elif pending_text.endswith(audio_text):
+                    audio_text = pending_text
+                else:
+                    audio_text = pending_text + audio_text
+            delta_text = self.segment_text_delta(request_id, audio_text, turn_id=text_turn_id)
             last_idx = len(audio_chunks) - 1
             sample_rate_hz = _sample_rate_hz(mm_output)
             audio_text_marks = _audio_text_marks(mm_output)
@@ -340,6 +364,16 @@ class MiniCPMO45DataPlaneSession:
                     yield from pending_audio
                     return
                 request_state.pending_audio_without_text = pending_audio
+            elif text_turn_state is not None:
+                pending_text = text_turn_state.pending_text_without_audio
+                if not pending_text:
+                    pending_text.append(text)
+                elif text == pending_text[-1]:
+                    pass
+                elif text.startswith(pending_text[-1]):
+                    pending_text[-1] = text
+                else:
+                    pending_text.append(text)
 
         if tts_segment_end:
             if unit_end_of_turn and request_state is not None and request_state.pending_audio_without_text:
@@ -462,18 +496,49 @@ class MiniCPMO45DataPlaneSession:
             return text
         turn_state = self._requests.setdefault(request_id, _RequestState()).turn(turn_id)
         sent_text = turn_state.sent_segment_text
+        last_segment_text = turn_state.last_segment_text
         if not sent_text:
             delta_text = text
-        elif text == sent_text:
+        elif text == sent_text or text == last_segment_text:
             delta_text = ""
+        elif last_segment_text and text.startswith(last_segment_text):
+            # Streaming snapshots for one producer segment grow from the
+            # immediately preceding snapshot, even when the turn cursor also
+            # contains text from older segments.
+            delta_text = text[len(last_segment_text) :]
         elif text.startswith(sent_text):
             delta_text = text[len(sent_text) :]
         else:
-            # The producer sends text for the current thinker segment, not a
-            # cumulative turn snapshot. Distinct adjacent segments need not
-            # have a prefix relationship and must both remain visible.
-            delta_text = text
-        turn_state.sent_segment_text = text
+            # Fixed Code2Wav packetization can combine one pending text-only
+            # segment with the following audio-bearing segment. Consecutive
+            # packets then carry overlapping windows such as
+            # ``"A B"`` -> ``"B C"``. Emit only the non-overlapping suffix;
+            # otherwise the realtime transcript repeats every shared window.
+            # A one-character/whitespace match is too weak and can occur at an
+            # ordinary segment boundary, so preserve such segments verbatim.
+            overlap = 0
+            max_overlap = min(len(sent_text), len(text))
+            for size in range(max_overlap, 1, -1):
+                prefix = text[:size]
+                stripped_prefix = prefix.strip()
+                # A shared single English word is ambiguous at a genuine
+                # segment boundary (for example ``"by James"`` followed by
+                # ``"James Cameron"``).  Fixed packet windows normally carry
+                # several words of overlap, which is strong enough evidence
+                # to deduplicate.  Scripts without whitespace (notably CJK)
+                # use four non-ASCII characters as the corresponding floor.
+                strong_overlap = len(stripped_prefix.split()) >= 2 or (
+                    len(stripped_prefix) >= 4 and any(ord(char) > 127 for char in stripped_prefix)
+                )
+                if strong_overlap and sent_text.endswith(prefix):
+                    overlap = size
+                    break
+            delta_text = text[overlap:]
+        # Keep a cumulative turn cursor. The producer may alternate between
+        # cumulative snapshots and overlapping segment windows; retaining only
+        # the last window loses the prefix needed to deduplicate later packets.
+        turn_state.sent_segment_text = sent_text + delta_text
+        turn_state.last_segment_text = text
         return delta_text
 
     def slice_cumulative_audio(self, request_id: str | None, audio_data: object) -> object:

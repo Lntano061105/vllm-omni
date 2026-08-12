@@ -60,9 +60,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self.talker_local_decode_steps = (
             configured_local_steps if current_stage_id == local_decode_stage_id else 1
         )
-        if self.talker_local_decode_steps not in (1, 2, 4):
+        if self.talker_local_decode_steps not in (1, 2, 4, 8, 16, 32, 64):
             raise ValueError(
-                "talker_local_decode_steps must be 1, 2, or 4, "
+                "talker_local_decode_steps must be a supported power of two "
+                "between 1 and 64, "
                 f"got {self.talker_local_decode_steps}"
             )
         if self.talker_local_decode_steps > 1:

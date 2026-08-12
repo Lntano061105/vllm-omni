@@ -1,0 +1,36 @@
+# Rejected aggressive SPEAK-RTF ablation pinned to physical NPU 5.
+# The combined path reached Stage-0/Stage-1 ACLGraph replay but produced no
+# first audio packet before the duplex client timeout. Keep only as a record
+# of the incompatible local64 + continuation-2 + fused-encoder combination.
+# It combines three independently useful reductions in the hot path:
+# 1) one runner call can cover a complete 50-frame Talker chunk;
+# 2) Token2Wav Conformer uses Ascend fused relative attention;
+# 3) two native one-second SPEAK continuation units share one Stage-0 append.
+base_config: minicpmo_4_5_duplex_euler_local64_zero_wait_npu5.yaml
+pipeline: minicpmo_4_5
+
+duplex_session:
+  native_silence_continuation_delay_ms: 0
+  native_silence_continuation_units_per_append: 2
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      code2wav_cache_initial_state: true
+      code2wav_cross_prompt_batching: true
+      code2wav_prewarm: true
+      token2wav_cfg_mode: conditional
+      token2wav_solver: euler
+      token2wav_n_timesteps: 1
+      token2wav_remove_hift_weight_norm: true
+      token2wav_npu_fused_encoder_attention: true
+      talker_emit_codec_chunks: true
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 50
+      codec_left_context_frames: 3
+      talker_local_decode_stage_id: 1
+      talker_local_decode_steps: 64

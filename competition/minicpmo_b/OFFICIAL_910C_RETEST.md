@@ -4,6 +4,63 @@
 开发结果不能填入最终成绩表。所有基线/优化测试必须使用相同模型目录、数据、
 请求顺序、两次 warmup 和空闲卡。
 
+建议先用总编排器打印完整计划；dry-run 不启动服务，也不占用 NPU：
+
+```bash
+python competition/minicpmo_b/scripts/run_official_910c_retest.py \
+  --image-digest quay.io/ascend/vllm-omni@sha256:REPLACE_WITH_REAL_DIGEST \
+  --model-path /workspace/MiniCPM-o-4_5 \
+  --daily-omni-root /tmp/minicpmo_b_daily_omni \
+  --videomme-root /tmp/minicpmo_b_videomme \
+  --seed-tts-root /tmp/minicpmo_b_seedtts
+```
+
+仅在官方空闲单卡 910C 主机确认计划后执行：
+
+```bash
+python competition/minicpmo_b/scripts/run_official_910c_retest.py \
+  --image-digest quay.io/ascend/vllm-omni@sha256:REPLACE_WITH_REAL_DIGEST \
+  --execute --confirm-single-910c
+```
+
+编排器按阶段写入 `orchestrator_state/*.json`，命令哈希不变且已通过的阶段会自动
+跳过；可用重复的 `--phase NAME` 仅执行指定阶段。它包含 910C/单可见卡/残留服务
+preflight、模型全部 checkpoint 分片、Token2Wav ONNX/PT 资产、三套完整数据、
+Whisper/WavLM/UTMOS、依赖版本、端口、磁盘空间与 S3Tokenizer/campplus CPU 加载探针，
+以及环境冻结、基线/优化 c1/c4/c8、双工 RTF、多轮门禁、三项精度、性能
+汇总及相对门禁。任何阶段失败都会立即停止。Demo 与录屏仍需按第 6 节人工完成。
+
+执行模式还会先写入 `orchestrator_state/orchestrator_plan.json`，冻结完整输入参数、
+26 阶段顺序、规范命令及 SHA256。最终证据审计会用当前提交中的
+`build_phases()` 重新生成计划，并逐项核对计划与每个阶段 marker；即使有人同步修改
+marker 中的命令与哈希，只要命令偏离规范计划也会失败。
+
+总编排共 26 个阶段。性能矩阵、Realtime 双工和三项精度各自生成
+`run_protocol.json`；基线与优化版必须具有完全相同的输入参数、请求顺序、warmup、
+并发、元数据文件 SHA256 和媒体目录 inventory fingerprint。deploy YAML 及其 SHA256
+记录在 `variant` 区域，允许基线与优化版不同。五个 `protocol-*` 阶段会在对应结果
+门禁之前比较两侧 fingerprint；最终证据审计还会直接重算一次，不只信任已生成的
+`protocol_gate_*.json`。
+
+Whisper 与 WavLM 必须准备为实际展开的离线模型目录，不要直接指向 Hugging Face
+cache 中含符号链接的 snapshot。协议 inventory 会拒绝 symlink，环境冻结还会对
+`config.json` 和权重文件计算内容 SHA256，避免复测依赖容器外 cache 或悬空链接。
+所有 benchmark 显式使用 `seed=0`；Daily-Omni 与 Seed-TTS 按该 seed 的确定性顺序
+运行，Video-MME 固定 `disable_shuffle=true`。这些参数均写入 A/B protocol 并由最终
+审计重新校验，不能依赖上游 CLI 默认值。
+
+官方 26 阶段完成后，如评测时间允许，建议再执行一次反序 fresh-start 确认：
+
+```bash
+competition/minicpmo_b/scripts/run_paired_confirmation.sh
+```
+
+主轮顺序为 A1（基线）→B1（优化），确认轮反转为 B2→A2，并保持相同输入、两次
+warmup、c1/c4/c8 与统计口径。辅助 gate 要求两个配对方向的 TTFT/TTFP 均至少改善
+10%、SPEAK 生成 RTF 均至少改善 15%，且同一版本两次 fresh-start 的指标漂移不超过
+10%。该结果用于排除编译热身、服务启动顺序和机器漂移造成的虚假收益，不替代主办方
+官方脚本和 26 阶段主成绩；若目录存在，最终审计与归档会强制其所有 gate 通过。
+
 ## 1. 环境冻结
 
 ```bash
@@ -11,6 +68,7 @@ cd /vllm-workspace/vllm-omni
 export MODEL_PATH=/workspace/MiniCPM-o-4_5
 export NPU_DEVICE=0
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
+export CONTAINER_IMAGE_DIGEST=quay.io/ascend/vllm-omni@sha256:REPLACE_WITH_REAL_DIGEST
 
 OUTPUT_DIR=competition/minicpmo_b/results/official_910c/environment \
 HASH_MODEL_WEIGHTS=1 \
@@ -78,7 +136,18 @@ competition/minicpmo_b/scripts/benchmark_duplex_rtf.sh
 RESULT_DIR=competition/minicpmo_b/results/official_910c_optimized/duplex_rtf \
 NUM_PROMPTS=32 MAX_CONCURRENCY=1 \
 competition/minicpmo_b/scripts/benchmark_duplex_rtf.sh
+
+RESULT_DIR=competition/minicpmo_b/results/official_910c_optimized/duplex_rtf \
+NUM_PROMPTS=64 MAX_CONCURRENCY=4 \
+competition/minicpmo_b/scripts/benchmark_duplex_rtf.sh
+
+RESULT_DIR=competition/minicpmo_b/results/official_910c_optimized/duplex_rtf \
+NUM_PROMPTS=128 MAX_CONCURRENCY=8 \
+competition/minicpmo_b/scripts/benchmark_duplex_rtf.sh
 ```
+
+基线服务也必须执行相同 c1/c4/c8 三组命令；除 `RESULT_DIR` 外不得改变输入、
+warmup、请求顺序或统计参数。
 
 至少提取 mean/p50/p99 `audio_speak_generation_rtf`，并同时保留
 `audio_speak_tail_rtf`、全部 `audio_chunk_rtf`、TTFT、TTFP、E2EL、吞吐、
@@ -86,34 +155,184 @@ continuity 和 underrun。`audio_speak_generation_rtf` 依据 Realtime audio del
 的模型阶段元数据分离 SPEAK 生成与尾部，是本地复测代理；最终排名必须使用
 主办方脚本的阶段判定与统计口径。
 
-## 5. 三项完整精度门禁
+每组优化结果必须执行自动门禁。当前默认方案包含 Stage 1 FULL decode、reference
+cache、13/25 固定包和完整 runner 预热：
 
 ```bash
-SUITE=daily-omni NUM_PROMPTS=1197 MAX_CONCURRENCY=1 \
-RESULT_DIR=competition/minicpmo_b/results/official_910c/accuracy/daily-omni \
+python competition/minicpmo_b/scripts/gate_duplex_candidate.py \
+  competition/minicpmo_b/results/official_910c_baseline/duplex_rtf/native_duplex_c1_n32.json \
+  competition/minicpmo_b/results/official_910c_optimized/duplex_rtf/native_duplex_c1_n32.json \
+  --profile combined \
+  --output competition/minicpmo_b/results/official_910c_optimized/duplex_rtf/gate_c1.json
+
+python competition/minicpmo_b/scripts/validate_candidate_log.py \
+  competition/minicpmo_b/results/official_910c_optimized/server.log \
+  --require-stage0-mm-cache-disabled \
+  --require-stage1-full-decode \
+  --require-stage0-ref-cache \
+  --require-stage2-prompt-cache \
+  --require-stage2-runner-prewarm \
+  --require-stage1-cpu-slot-mapping \
+  --require-stage1-graph-sampler \
+  --require-stage1-binary-argmax \
+  --output competition/minicpmo_b/results/official_910c_optimized/activation_gate.json
+```
+
+若最终默认配置没有晋级某项实验开关，应删除对应的 `--require-*`，但不得保留开关
+又跳过其 activation gate。c4/c8 使用相同方式分别生成 `gate_c4.json`、
+`gate_c8.json`。
+
+在任何性能成绩晋级前，必须额外通过同一 WebSocket session 的多轮边界门禁，防止
+resumable segment 水位、TTS terminal control packet 或 playback 状态跨轮污染：
+
+```bash
+HOST=127.0.0.1 PORT=8091 \
+NUM_PROMPTS=2 MAX_CONCURRENCY=1 TURNS_PER_SESSION=3 NUM_WARMUPS=0 \
+RESULT_DIR=competition/minicpmo_b/results/official_910c_optimized/multiturn_s2_t3 \
+RESULT_FILENAME=native_duplex_rtf.json \
+competition/minicpmo_b/scripts/benchmark_duplex_rtf.sh
+```
+
+硬门槛：`audio_turns=6`、每个 run 的 `done_count=3`、`cancelled_count=0`、
+`stale_audio_delta_count=0`、`truncate_count=0`、`lifecycle_counts_ok=true`、
+`cross_turn_independent_ok=true`，并检查服务日志不存在下降水位丢包告警
+`Enqueue save_async ... previous_chunks_sent=`。若任一项失败，不得用单轮 n=32/64/128
+结果替代稳定性结论。
+
+Stage 1 热路径开关已经进入当前默认配置；以下拆分命令可用于单独复核其 activation：
+
+```bash
+python competition/minicpmo_b/scripts/validate_candidate_log.py \
+  competition/minicpmo_b/results/official_910c_optimized/server.log \
+  --require-stage1-full-decode \
+  --require-stage1-cpu-slot-mapping \
+  --require-stage1-graph-sampler \
+  --require-stage1-binary-argmax
+
+python competition/minicpmo_b/scripts/gate_duplex_candidate.py \
+  competition/minicpmo_b/results/official_910c_baseline/duplex_rtf/native_duplex_c1_n32.json \
+  competition/minicpmo_b/results/official_910c_optimized/duplex_rtf/native_duplex_c1_n32.json \
+  --profile stage1-hotpath
+```
+
+910C 日志若出现 CPU slot mapping 回退，或 graph sampler activation marker 缺失，
+该轮成绩必须作废并恢复 local4 可靠配置复测。
+
+## 5. 三项完整精度门禁
+
+先在相同数据快照、请求数和并发下运行官方基线：
+
+```bash
+SUITE=daily-omni MAX_CONCURRENCY=1 REQUIRE_STAGE0_MM_CACHE_DISABLED=1 \
+DEPLOY_CONFIG=competition/minicpmo_b/config/ablations/minicpmo_4_5_official_baseline_accuracy_cacheoff.yaml \
+RESULT_DIR=competition/minicpmo_b/results/official_910c_baseline/accuracy/daily-omni \
 competition/minicpmo_b/scripts/run_accuracy_case.sh
 
-SUITE=videomme NUM_PROMPTS=2700 MAX_CONCURRENCY=4 \
-RESULT_DIR=competition/minicpmo_b/results/official_910c/accuracy/videomme \
+SUITE=videomme NUM_PROMPTS=2700 MAX_CONCURRENCY=4 REQUIRE_STAGE0_MM_CACHE_DISABLED=1 \
+DEPLOY_CONFIG=competition/minicpmo_b/config/ablations/minicpmo_4_5_official_baseline_accuracy_cacheoff.yaml \
+RESULT_DIR=competition/minicpmo_b/results/official_910c_baseline/accuracy/videomme \
 competition/minicpmo_b/scripts/run_accuracy_case.sh
 
 SEED_TTS_HF_WHISPER_MODEL=/workspace/whisper-large-v3 \
+SEED_TTS_WAVLM_MODEL=/workspace/wavlm-base-plus \
+SEED_TTS_UTMOS_JIT_FILE=/workspace/utmos/utmos.jit \
+SEED_TTS_SIM_EVAL=1 SEED_TTS_UTMOS_EVAL=1 \
+MIN_SEED_TTS_MEAN_SIM=-1 MIN_SEED_TTS_MEAN_UTMOS=0 \
 SUITE=seed-tts NUM_PROMPTS=1000 MAX_CONCURRENCY=4 \
-RESULT_DIR=competition/minicpmo_b/results/official_910c/accuracy/seed-tts \
+REQUIRE_STAGE0_MM_CACHE_DISABLED=1 \
+DEPLOY_CONFIG=competition/minicpmo_b/config/ablations/minicpmo_4_5_official_baseline_accuracy_cacheoff.yaml \
+RESULT_DIR=competition/minicpmo_b/results/official_910c_baseline/accuracy/seed-tts \
 competition/minicpmo_b/scripts/run_accuracy_case.sh
 ```
 
+基线精度 overlay 与上游 `vllm_omni/deploy/minicpmo_4_5.yaml` 的唯一差异是 Stage 0
+`mm_processor_cache_gb: 0`，并由单测做完整配置等价比较。该设置只修复长稳缓存协议，
+不改变模型输出；基线性能矩阵仍必须使用未经修改的上游 baseline YAML。
+
+再运行优化版；除 deploy config、结果目录和优化版 activation gate 外，其余输入
+必须与基线完全一致：
+
+```bash
+SUITE=daily-omni MAX_CONCURRENCY=1 REQUIRE_STAGE0_MM_CACHE_DISABLED=1 \
+DEPLOY_CONFIG=competition/minicpmo_b/config/minicpmo_4_5_910c_low_latency.yaml \
+RESULT_DIR=competition/minicpmo_b/results/official_910c_optimized/accuracy/daily-omni \
+competition/minicpmo_b/scripts/run_accuracy_case.sh
+
+SUITE=videomme NUM_PROMPTS=2700 MAX_CONCURRENCY=4 REQUIRE_STAGE0_MM_CACHE_DISABLED=1 \
+DEPLOY_CONFIG=competition/minicpmo_b/config/minicpmo_4_5_910c_low_latency.yaml \
+RESULT_DIR=competition/minicpmo_b/results/official_910c_optimized/accuracy/videomme \
+competition/minicpmo_b/scripts/run_accuracy_case.sh
+
+SEED_TTS_HF_WHISPER_MODEL=/workspace/whisper-large-v3 \
+SEED_TTS_WAVLM_MODEL=/workspace/wavlm-base-plus \
+SEED_TTS_UTMOS_JIT_FILE=/workspace/utmos/utmos.jit \
+SEED_TTS_SIM_EVAL=1 SEED_TTS_UTMOS_EVAL=1 \
+MIN_SEED_TTS_MEAN_SIM=-1 MIN_SEED_TTS_MEAN_UTMOS=0 \
+REQUIRE_STAGE0_MM_CACHE_DISABLED=1 \
+SUITE=seed-tts NUM_PROMPTS=1000 MAX_CONCURRENCY=4 \
+DEPLOY_CONFIG=competition/minicpmo_b/config/minicpmo_4_5_910c_low_latency.yaml \
+RESULT_DIR=competition/minicpmo_b/results/official_910c_optimized/accuracy/seed-tts \
+competition/minicpmo_b/scripts/run_accuracy_case.sh
+```
+
+Seed-TTS 生成阶段会先把 WAV 与 `seed_tts_eval_manifest.jsonl` 保存到结果目录的
+`generated_audio_checkpoint/`，然后运行 Whisper/WavLM/UTMOS。若质量评测中断，
+先释放服务和 NPU，再用以下命令离线续评，无需重新生成 1000 条音频：
+
+```bash
+SEED_TTS_EVAL_DEVICE=cpu SEED_TTS_WHISPER_BATCH_SIZE=8 \
+SEED_TTS_SIM_EVAL=1 SEED_TTS_UTMOS_EVAL=1 \
+SEED_TTS_HF_WHISPER_MODEL=/workspace/whisper-large-v3 \
+SEED_TTS_WAVLM_MODEL=/workspace/wavlm-base-plus \
+SEED_TTS_UTMOS_JIT_FILE=/workspace/utmos/utmos.jit \
+python competition/minicpmo_b/scripts/resume_seed_tts_quality.py \
+  competition/minicpmo_b/results/official_910c_optimized/accuracy/seed-tts/generated_audio_checkpoint/seed_tts_eval_manifest.jsonl \
+  --base-result competition/minicpmo_b/results/official_910c_optimized/accuracy/seed-tts/seed_tts_generation_performance_checkpoint.json \
+  --output competition/minicpmo_b/results/official_910c_optimized/accuracy/seed-tts/seed_tts_quality_resumed.json
+```
+
+基线目录使用相同命令单独续评。manifest 必须为 1000 行，且最终质量 JSON 的
+evaluated/failed 数量仍须满足下述完整性门槛；只有合并结果中的
+`seed_tts_quality_complete=true` 才可进入精度比较。
+
+Daily-Omni 不硬编码历史条数：脚本读取准备后的 `qa.json` 并评测全部行。当前本地
+10-shard 镜像实测为 1196 条；若主办方最终数据版本为其他条数，以其 `qa.json`
+完整行数为准，并在环境清单中记录数据文件 SHA256。
+
+默认优化 YAML 在 Stage 0 显式设置 `mm_processor_cache_gb: 0`。这是长稳正确性
+门禁：vLLM 的默认 LRU 需要 API sender 与 Engine receiver 保持完全相同的访问/
+淘汰顺序，并发、重试或请求在入队前失败会造成两端状态分叉，最终出现
+`AssertionError: Expected a cached item for mm_hash=...`。关闭该缓存不会跳过 VPM、
+APM 或 LLM，也不改变权重、采样和输出；它只避免复用前端 HF processor 的结果。
+精度与 Demo 服务日志必须通过 `validate_candidate_log.py`，上述断言即使只出现一次，
+该轮完整结果也必须作废重跑。
+
 硬门槛：Daily-Omni ≥ 0.78、Video-MME ≥ 0.68、Seed-TTS mean WER ≤ 0.05；
-同时相对主办方对应官方基线的精度降幅不得超过 2 个百分点。
+同时相对对应官方基线的精度降幅不得超过 2 个百分点。每个结果目录必须只保留
+本轮唯一一个 `qwen_omni_acc_*.json`，再执行：
+
+```bash
+for suite in daily-omni videomme seed-tts; do
+  python competition/minicpmo_b/scripts/compare_accuracy_results.py \
+    "${suite}" \
+    "competition/minicpmo_b/results/official_910c_baseline/accuracy/${suite}" \
+    "competition/minicpmo_b/results/official_910c_optimized/accuracy/${suite}" \
+    --output "competition/minicpmo_b/results/official_910c_optimized/accuracy/${suite}/baseline_gate.json"
+done
+```
+
+`MIN_SEED_TTS_MEAN_SIM=-1` 与 `MIN_SEED_TTS_MEAN_UTMOS=0` 只用于强制完整产出
+1000/1000 条 SIM/UTMOS，并非质量晋级阈值；真正晋级由随后基线比较的 2pp 门禁
+决定。运行前必须把 Whisper、WavLM 和 `balacoon/utmos` 的 `utmos.jit` 放入离线
+镜像/HF cache，禁止评测过程中临时联网。若主办方最终文档给出不同 TTS-Seed
+指标或归一化口径，以官方口径替换该比较，不得用本地 WER 规避官方精度要求。
 
 ## 6. Demo 与稳定性
 
 使用默认优化配置启动服务：
 
 ```bash
-PORT=8091 competition/minicpmo_b/scripts/start_server.sh \
-  > competition/minicpmo_b/results/official_910c/demo_server.log 2>&1 &
-demo_server_pid=$!
+PORT=8091 competition/minicpmo_b/scripts/start_server.sh
 ```
 
 先运行 `smoke_test.sh`，随后接入官方 vLLM-Omni Demo，依次录制文本、音频、
@@ -121,12 +340,71 @@ demo_server_pid=$!
 HTTP/Demo 错误、音频中断次数、空包、underrun 和 NPU 资源峰值。视频必须能看出
 首段音频开始播放、后续 chunk 连续到达以及完整交互结束。
 
-结束后执行 `kill -INT "${demo_server_pid}"` 并等待服务清理完成，避免残留子进程
-影响后续资源数据。
+复制机器可读的 Demo 证据模板，并在录制完成后填入相对路径与真实统计：
+
+```bash
+mkdir -p competition/minicpmo_b/results/official_910c/demo
+cp competition/minicpmo_b/DEMO_EVIDENCE_TEMPLATE.json \
+  competition/minicpmo_b/results/official_910c/demo/demo_evidence.json
+```
+
+四个 `scenarios.*.passed` 必须分别由文本、音频、视频和 text+audio 的完整交互
+证明；`service_log` 与 `video_file` 必须指向 Demo 目录内的非空文件。不要仅凭 HTTP
+200 填写通过。
+
+结束后在服务所在终端发送一次 Ctrl-C，并等待 API Server 与全部 Stage 进程
+自然完成清理；不要用 `kill/pkill` 跳过编排器的退出流程。
 
 ## 7. 提交审计
+
+先执行静态门禁：
+
+```bash
+python competition/minicpmo_b/scripts/validate_submission_package.py \
+  --require-tracked \
+  --output competition/minicpmo_b/results/official_910c/submission_package_audit.json
+```
+
+确认工作树干净、所有必需文件已提交，并完成全部 910C/Demo 证据后生成源码快照：
+
+```bash
+python competition/minicpmo_b/scripts/build_submission_artifacts.py \
+  --base-ref origin/minicpm-challenge \
+  --output-dir competition/minicpmo_b/results/official_910c/final_submission/source
+```
 
 最终目录必须包含：冻结后的代码/patch、默认 YAML、启动与 benchmark 脚本、
 三项精度原始 JSON/逐项输出、c1/c4/c8 性能 JSON、服务日志、环境与模型清单、
 Demo 视频、性能报告和从全新官方镜像开始的复现命令。任何缺失或无法由日志证明
 FULL decode 图真实生效的成绩均视为未完成。
+
+根据原始 JSON 自动生成最终报告（仍需人工补充技术说明或异常说明时，可在生成后追加）：
+
+```bash
+python competition/minicpmo_b/scripts/render_final_report.py
+```
+
+报告保存为 `results/official_910c/final_submission/FINAL_REPORT.md`，且不得再含
+“待填写”。最后执行全证据审计：
+
+```bash
+python competition/minicpmo_b/scripts/validate_final_evidence.py \
+  --output competition/minicpmo_b/results/official_910c/final_evidence_audit.json
+```
+
+该门禁直接检查单卡 910C preflight、模型/数据/评测权重 hash、基线与优化版
+c1/c4/c8 原始结果和服务日志、SPEAK RTF gate、多轮原始 JSON、三项完整精度与 2pp
+gate、26 个阶段的命令/哈希/退出状态、Demo 四场景/视频/日志、干净源码制品及其 SHA256。只有审计结果
+`passed=true` 才能声明提交包完成。
+
+审计通过后构建确定性最终归档，并再次验证归档内部的逐文件 SHA256：
+
+```bash
+python competition/minicpmo_b/scripts/build_final_submission.py
+python competition/minicpmo_b/scripts/validate_final_evidence.py --require-package
+```
+
+最终上传文件为
+`results/official_910c/final_submission/package/minicpmo_b_official_910c.tar.gz`，外部
+摘要保存在同目录 `archive_sha256.txt`。归档拒绝符号链接、重复/逃逸路径以及未被
+清单覆盖的文件，并固定成员顺序、mtime、UID/GID 和 gzip 时间戳以便复现。

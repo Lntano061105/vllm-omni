@@ -1,0 +1,31 @@
+{
+  "official_910c": true,
+  "demo_name": "vLLM-Omni official MiniCPM-o 4.5 Demo",
+  "started_utc": "REPLACE_ME",
+  "finished_utc": "REPLACE_ME",
+  "continuous_run_minutes": 0,
+  "service_log": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+  "video_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+  "service_exit_clean": false,
+  "unexpected_error_count": 0,
+  "audio_interruption_count": 0,
+  "empty_audio_packet_count": 0,
+  "scenarios": {
+    "text": {
+      "passed": false,
+      "notes": ""
+    },
+    "audio": {
+      "passed": false,
+      "notes": ""
+    },
+    "video": {
+      "passed": false,
+      "notes": ""
+    },
+    "text_audio": {
+      "passed": false,
+      "notes": ""
+    }
+  }
+}

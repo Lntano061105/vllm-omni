@@ -176,8 +176,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
 
-        # If the request is preempted, skip the already saved chunks.
-        if confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
+        resumable_segment_boundary = bool(
+            getattr(request, "resumable", False) and is_segment_finished
+        )
+        # If the request is preempted, skip the already saved chunks.  A
+        # resumable segment boundary is the exception: the scheduler has
+        # already reset its per-segment computed-token cursor by the time the
+        # terminal sparse multimodal packet is handed to the connector, so
+        # its lower cursor is expected and the boundary must still be sent.
+        if (
+            confirmed_num_computed_tokens
+            < self.requests_num_chunks_sent.get(request.external_req_id, 0)
+            and not resumable_segment_boundary
+        ):
             logger.warning(
                 f"Enqueue save_async for request {request.external_req_id}, "
                 f"request.num_computed_tokens={request.num_computed_tokens}, "
@@ -186,7 +197,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
             return
 
-        self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
+        external_req_id = request.external_req_id
+        self.requests_num_chunks_sent[external_req_id] = confirmed_num_computed_tokens
         task = {
             "multimodal_output": multimodal_output,
             "request": request,
@@ -194,6 +206,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_segment_finished": is_segment_finished,
         }
         self._pending_save_reqs.append(task)
+        if resumable_segment_boundary:
+            # A resumable AR request reuses its external request id across
+            # input/TTS segments, while the scheduler resets its per-segment
+            # computed-token cursor.  Keeping the completed segment's
+            # watermark makes the first chunks of the next segment look like
+            # a preemption replay and drops them (including the terminal
+            # control-only TTS boundary).  Reset only after the segment
+            # boundary has been accepted into the ordered save queue, so
+            # within-segment preemption deduplication remains intact.
+            self.requests_num_chunks_sent.pop(external_req_id, None)
         with self._save_cond:
             self._save_cond.notify()
 

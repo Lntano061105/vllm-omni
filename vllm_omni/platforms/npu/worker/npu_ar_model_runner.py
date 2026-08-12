@@ -50,7 +50,22 @@ from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
-from vllm_omni.worker.talker_local_decode import talker_state_allows_local_step
+from vllm_omni.worker.talker_local_decode import (
+    refresh_fixed_codec_history_row,
+    talker_state_allows_local_step,
+)
+
+
+def _config_bool(value: object, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(value, int):
+        return bool(value)
+    return default
 
 
 def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]:
@@ -126,9 +141,20 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self.talker_local_decode_steps = (
             configured_local_steps if current_stage_id == local_decode_stage_id else 1
         )
-        if self.talker_local_decode_steps not in (1, 2, 4):
+        self.talker_local_cpu_slot_mapping = (
+            _config_bool(connector_extra.get("talker_local_cpu_slot_mapping"))
+            if current_stage_id == local_decode_stage_id
+            else False
+        )
+        self.talker_graph_sampler = (
+            _config_bool(connector_extra.get("talker_graph_sampler"))
+            if current_stage_id == local_decode_stage_id
+            else False
+        )
+        if self.talker_local_decode_steps not in (1, 2, 4, 8, 16, 32, 64):
             raise ValueError(
-                "talker_local_decode_steps must be 1, 2, or 4, "
+                "talker_local_decode_steps must be a supported power of two "
+                "between 1 and 64, "
                 f"got {self.talker_local_decode_steps}"
             )
         if self.talker_local_decode_steps > 1 and self.use_async_scheduling:
@@ -138,6 +164,36 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        self.talker_codec_history = self._make_buffer(
+            self.max_num_reqs,
+            16,
+            dtype=torch.int64,
+            numpy=False,
+        )
+        self.talker_codec_eos_allowed = self._make_buffer(
+            self.max_num_reqs,
+            dtype=torch.bool,
+            numpy=False,
+        )
+        self.talker_codec_history.cpu.fill_(-1)
+        self.talker_codec_history.copy_to_gpu()
+        self.talker_codec_eos_allowed.cpu.fill_(False)
+        self.talker_codec_eos_allowed.copy_to_gpu()
+        self._talker_graph_history_req_ids: list[str | None] = [
+            None
+        ] * self.max_num_reqs
+        self._talker_graph_history_steps = np.full(
+            self.max_num_reqs,
+            -1,
+            dtype=np.int64,
+        )
+        self._talker_graph_eos_allowed_cpu = np.full(
+            self.max_num_reqs,
+            -1,
+            dtype=np.int8,
+        )
+        self._talker_graph_history_incremental_updates = 0
+        self._talker_cpu_slot_mapping_updates = 0
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
         self._async_chunk = getattr(self.model_config, "async_chunk", False)
@@ -179,6 +235,168 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     "that declares supports_talker_local_decode"
                 )
             logger.info("NPU Talker runner-local decode enabled with %d steps", self.talker_local_decode_steps)
+        if self.talker_local_cpu_slot_mapping:
+            logger.info(
+                "NPU Talker runner-local CPU slot mapping enabled; "
+                "single-token local steps bypass the full GPU slot kernel"
+            )
+        if self.talker_graph_sampler:
+            logger.info(
+                "NPU Talker graph sampler inputs enabled with fixed %d-token history",
+                self.talker_codec_history.gpu.shape[1],
+            )
+
+    def _prepare_talker_graph_sampler_inputs(self, req_ids: list[str]) -> None:
+        """Refresh fixed-shape history/EOS buffers consumed inside FULL graph."""
+        if not self.talker_graph_sampler:
+            return
+        num_reqs = len(req_ids)
+        for row, req_id in enumerate(req_ids):
+            info = self.model_intermediate_buffer.get(req_id)
+            state = info.get("audio_state") if isinstance(info, dict) else None
+            step = int(state.get("step", 0)) if isinstance(state, dict) else 0
+            codes = state.get("codes") if isinstance(state, dict) else None
+            audio_codes = info.get("audio_codes", {}) if isinstance(info, dict) else {}
+            if not isinstance(audio_codes, dict):
+                audio_codes = {}
+            if not isinstance(codes, torch.Tensor):
+                codes = audio_codes.get("accumulated")
+            current = audio_codes.get("current")
+            mode = refresh_fixed_codec_history_row(
+                self.talker_codec_history.gpu[row],
+                codes=codes if isinstance(codes, torch.Tensor) else None,
+                current=current if isinstance(current, torch.Tensor) else None,
+                step=step,
+                cached_step=int(self._talker_graph_history_steps[row]),
+                same_request=self._talker_graph_history_req_ids[row] == req_id,
+            )
+            self._talker_graph_history_req_ids[row] = req_id
+            self._talker_graph_history_steps[row] = step
+            if mode == "advanced":
+                self._talker_graph_history_incremental_updates += 1
+                if self._talker_graph_history_incremental_updates == 1:
+                    logger.info(
+                        "Used NPU Talker incremental graph sampler history fast path"
+                    )
+
+            min_tokens = int(state.get("min_tokens", 50)) if isinstance(state, dict) else 50
+            allowed = step >= min_tokens
+            allowed_int = int(allowed)
+            if int(self._talker_graph_eos_allowed_cpu[row]) != allowed_int:
+                self.talker_codec_eos_allowed.gpu[row] = allowed
+                self._talker_graph_eos_allowed_cpu[row] = allowed_int
+
+        # A compacted row must never inherit another request's circular state.
+        for row in range(num_reqs, self.max_num_reqs):
+            self._talker_graph_history_req_ids[row] = None
+            self._talker_graph_history_steps[row] = -1
+            self._talker_graph_eos_allowed_cpu[row] = -1
+
+    def _update_direct_talker_slot_mapping(
+        self,
+        num_reqs: int,
+        positions: torch.Tensor,
+    ) -> None:
+        """Compute local single-token slots on CPU, with a safe GPU fallback."""
+        positions_np = np.asarray(
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            dtype=np.int64,
+        )
+        if self._try_talker_cpu_slot_mapping(num_reqs, positions_np):
+            return
+        self.input_batch.block_table.compute_slot_mapping(
+            num_reqs,
+            self.query_start_loc.gpu[: num_reqs + 1],
+            positions[:num_reqs],
+        )
+
+    def _try_talker_cpu_slot_mapping(
+        self,
+        num_reqs: int,
+        positions_np: np.ndarray,
+    ) -> bool:
+        if not self.talker_local_cpu_slot_mapping:
+            return False
+        req_indices = np.arange(num_reqs, dtype=np.int32)
+        try:
+            self.input_batch.block_table.compute_slot_mapping_draft(
+                req_indices,
+                positions_np,
+            )
+        except (AssertionError, AttributeError, RuntimeError, ValueError) as exc:
+            logger.warning_once(
+                "NPU Talker CPU slot mapping is unavailable (%s); "
+                "falling back to the standard GPU kernel",
+                exc,
+            )
+            self.talker_local_cpu_slot_mapping = False
+            return False
+        self._talker_cpu_slot_mapping_updates += 1
+        if self._talker_cpu_slot_mapping_updates == 1:
+            logger.info("Used NPU Talker runner-local CPU slot mapping fast path")
+        return True
+
+    def _prepare_inputs(
+        self,
+        scheduler_output: SchedulerOutput,
+        num_scheduled_tokens: np.ndarray,
+    ):
+        """Use CPU slot mapping for the scheduler-visible pure-decode step.
+
+        The inherited Ascend runner computes slot mapping internally.  For the
+        Talker-only, one-token decode shape, temporarily replace that single
+        call with the same CPU draft implementation used by runner-local
+        substeps.  All prefills, speculative/CP paths, and unsupported block
+        layouts remain on the upstream implementation.
+        """
+        num_reqs = int(self.input_batch.num_reqs)
+        pure_single_token_decode = (
+            self.talker_local_cpu_slot_mapping
+            and self.pcp_size <= 1
+            and self.speculative_config is None
+            and num_reqs > 0
+            and num_scheduled_tokens.shape[0] >= num_reqs
+            and bool(np.all(num_scheduled_tokens[:num_reqs] == 1))
+            and not scheduler_output.scheduled_new_reqs
+            and not scheduler_output.scheduled_encoder_inputs
+            and bool(
+                np.all(
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    >= self.input_batch.num_prompt_tokens[:num_reqs]
+                )
+            )
+        )
+        if not pure_single_token_decode:
+            return super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+
+        block_table = self.input_batch.block_table
+        original_compute_slot_mapping = block_table.compute_slot_mapping
+        positions_np = np.asarray(
+            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+            dtype=np.int64,
+        )
+
+        def compute_slot_mapping_fast_or_fallback(
+            call_num_reqs: int,
+            query_start_loc: torch.Tensor,
+            positions: torch.Tensor,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            if not self._try_talker_cpu_slot_mapping(call_num_reqs, positions_np):
+                original_compute_slot_mapping(
+                    call_num_reqs,
+                    query_start_loc,
+                    positions,
+                    *args,
+                    **kwargs,
+                )
+
+        block_table.compute_slot_mapping = compute_slot_mapping_fast_or_fallback
+        try:
+            return super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+        finally:
+            block_table.compute_slot_mapping = original_compute_slot_mapping
 
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
@@ -297,11 +515,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             1,
             out=self.optimistic_seq_lens_cpu[:num_reqs],
         )
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            positions[:num_reqs],
-        )
+        self._update_direct_talker_slot_mapping(num_reqs, positions)
         update_cos_sin(positions)
 
     def _make_buffer(self, *size, dtype, numpy=True):
@@ -863,6 +1077,29 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         has_encoder_input = self.model_config.is_encoder_decoder and num_encoder_reqs > 0
 
         # Run forward pass
+        talker = getattr(self.model, "talker", None)
+        graph_head_kwargs = {}
+        if getattr(talker, "_talker_graph_head", False):
+            if cudagraph_mode == CUDAGraphMode.FULL:
+                # Project the graph's contiguous request-row prefix. Avoiding
+                # dynamic tensor indexing removes an Ascend FULL-graph gather
+                # that can replay with an invalid MTE address.
+                graph_head_kwargs["omni_num_sample_rows"] = num_reqs_padded
+            else:
+                graph_head_kwargs["omni_logits_indices"] = logits_indices
+        if self.talker_graph_sampler:
+            self._prepare_talker_graph_sampler_inputs(list(req_ids[:num_reqs]))
+            graph_sampler_rows = (
+                num_reqs_padded
+                if cudagraph_mode == CUDAGraphMode.FULL
+                else num_reqs
+            )
+            graph_head_kwargs.update(
+                omni_codec_history=self.talker_codec_history.gpu[:graph_sampler_rows],
+                omni_codec_eos_allowed=self.talker_codec_eos_allowed.gpu[
+                    :graph_sampler_rows
+                ],
+            )
         clear_kv_metadata = self.speculative_config is None
         with (
             record_function_or_nullcontext("forward"),
@@ -886,7 +1123,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             ) as kv_connector_output,
         ):
             hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+                num_tokens_padded,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                **model_kwargs,
+                **graph_head_kwargs,
             )
         with record_function_or_nullcontext("post process"):
             #  -------------------------------------- Omni-new -------------------------------------------------
@@ -906,6 +1149,21 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             # bookkeeping while preserving one-token attention semantics.
             direct_req_ids = list(req_ids[:num_reqs])
             direct_extra_steps = 0
+            local_graph_head_kwargs = graph_head_kwargs
+            if (
+                getattr(talker, "_talker_graph_head", False)
+                and cudagraph_mode != CUDAGraphMode.FULL
+            ):
+                # ``logits_indices`` belongs to the scheduler-visible query.
+                # The runner-local replay always packs one decode token per
+                # request at rows [0, num_reqs), so reusing a prefill/decode
+                # index here can address beyond the local hidden-state buffer
+                # inside FULL graph replay. Derive the local rows from the
+                # decode query starts instead.
+                local_graph_head_kwargs = dict(graph_head_kwargs)
+                local_graph_head_kwargs["omni_logits_indices"] = (
+                    self.query_start_loc.gpu[1 : num_reqs + 1] - 1
+                )
             while (
                 direct_extra_steps < self.talker_local_decode_steps - 1
                 and self._can_run_direct_talker_next_step(
@@ -920,6 +1178,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     inputs_embeds,
                     positions,
                 )
+                if self.talker_graph_sampler:
+                    self._prepare_talker_graph_sampler_inputs(direct_req_ids)
                 (
                     local_attn_metadata,
                     local_spec_decode_common_attn_metadata,
@@ -958,6 +1218,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         intermediate_tensors,
                         inputs_embeds,
                         **model_kwargs,
+                        **local_graph_head_kwargs,
                     )
                 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
                 attn_metadata = local_attn_metadata

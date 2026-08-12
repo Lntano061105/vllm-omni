@@ -2,15 +2,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import soundfile as sf
 import torch
 import torch.nn as nn
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    BatchedToken2WavState,
     PromptFeatures,
+    _SteadyNPUGraph,
+    state_shape_signature,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    _RuntimePrompt,
     _remove_weight_norm_for_inference,
 )
 
@@ -159,6 +164,8 @@ def _config(
     *,
     cache_initial_state: bool = False,
     cross_prompt_batching: bool = False,
+    runtime_prompt_cache_size: int = 0,
+    cache_runtime_initial_state: bool = False,
 ):
     return SimpleNamespace(
         model_config=SimpleNamespace(
@@ -168,6 +175,8 @@ def _config(
                     "code2wav_min_batch_size": minimum,
                     "code2wav_cache_initial_state": cache_initial_state,
                     "code2wav_cross_prompt_batching": cross_prompt_batching,
+                    "code2wav_runtime_prompt_cache_size": runtime_prompt_cache_size,
+                    "code2wav_cache_runtime_initial_state": cache_runtime_initial_state,
                     "prompt_cache_id": "shared",
                     "prompt_wav": "/fake/prompt.wav",
                 }
@@ -176,13 +185,21 @@ def _config(
     )
 
 
-def _model(*, cache_initial_state: bool = False, cross_prompt_batching: bool = False):
+def _model(
+    *,
+    cache_initial_state: bool = False,
+    cross_prompt_batching: bool = False,
+    runtime_prompt_cache_size: int = 0,
+    cache_runtime_initial_state: bool = False,
+):
     token2wav = _FakeToken2Wav()
     backend = BatchedToken2Wav(token2wav)
     model = MiniCPMO45Code2Wav(
         vllm_config=_config(
             cache_initial_state=cache_initial_state,
             cross_prompt_batching=cross_prompt_batching,
+            runtime_prompt_cache_size=runtime_prompt_cache_size,
+            cache_runtime_initial_state=cache_runtime_initial_state,
         )
     )
     model.backend = backend
@@ -450,6 +467,175 @@ def test_code2wav_prewarm_runs_initial_and_steady_shapes_then_synchronizes() -> 
     assert _FakePlatform.synchronized is True
 
 
+def test_code2wav_prewarm_covers_preloaded_runtime_prompt_shapes() -> None:
+    model, token2wav = _model(
+        runtime_prompt_cache_size=1,
+        cache_runtime_initial_state=True,
+    )
+    model._runtime_prompts["runtime-key"] = _RuntimePrompt(
+        cache_id="runtime-ref",
+        path="/fake/runtime.wav",
+        owners=set(),
+    )
+
+    class _FakePlatform:
+        @staticmethod
+        def synchronize():
+            pass
+
+    model._prewarm_backend(
+        {
+            "initial_codec_chunk_frames": 13,
+            "codec_chunk_frames": 50,
+            "codec_left_context_frames": 3,
+        },
+        _FakePlatform,
+    )
+
+    # Default and runtime prompts each build one initial state and execute the
+    # two live shapes. The runtime initial state remains cached for request 1.
+    assert token2wav.prompt_calls == 2
+    assert token2wav.flow.encoder.calls == [1, 1, 1, 1, 1, 1]
+    assert token2wav.hift.calls == [1, 1, 1, 1]
+    assert ("runtime-ref", "/fake/runtime.wav") in model.backend._initial_states
+
+
+def test_code2wav_runner_prewarm_executes_full_live_packet_path(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from vllm_omni.platforms import current_omni_platform
+
+    model, token2wav = _model(
+        runtime_prompt_cache_size=1,
+        cache_runtime_initial_state=True,
+    )
+    extra = model.vllm_config.model_config.stage_connector_config["extra"]
+    extra.update(
+        {
+            "code2wav_runner_prewarm": True,
+            "initial_codec_chunk_frames": 4,
+            "codec_chunk_frames": 25,
+            "codec_left_context_frames": 3,
+        }
+    )
+    waveform = torch.linspace(-0.25, 0.25, 1600)
+    _, entry = model._materialize_runtime_prompt(waveform, 16000)
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
+
+    model.runner_prewarm()
+
+    assert token2wav.prompt_calls == 1
+    assert token2wav.flow.encoder.calls == [1, 1, 1]
+    assert token2wav.hift.calls == [1, 1]
+    assert model._states == {}
+
+
+def test_steady_npugraph_dispatch_clones_outputs_and_shape_mismatch_falls_back(
+    monkeypatch,
+) -> None:
+    token2wav = _FakeToken2Wav()
+    adapter = BatchedToken2Wav(token2wav)
+    features = adapter.prepare_prompt("shared", "/fake/prompt.wav")
+    state = adapter.setup_batch(features, 1)[0]
+    static_state = adapter._clone_state(state)
+    output_state = adapter._clone_state(state)
+    static_tokens = torch.zeros((1, 2), dtype=torch.long)
+    graph_audio = torch.zeros(4)
+
+    class _FakeGraph:
+        calls = 0
+
+        @classmethod
+        def replay(cls):
+            cls.calls += 1
+            graph_audio.fill_(
+                float(
+                    static_tokens.sum()
+                    + static_features.speech_tokens.sum()
+                    + static_features.projected_speaker_embedding.sum()
+                    + static_features.mels.sum()
+                )
+            )
+            for cache_name in ("flow_cache", "hift_cache"):
+                inputs = getattr(static_state, cache_name)
+                outputs = getattr(output_state, cache_name)
+                for name in outputs:
+                    outputs[name].copy_(inputs[name] + 1)
+
+    graph_key = (
+        (tuple(static_tokens.shape), str(static_tokens.dtype), static_tokens.device.type),
+        int(features.mels.shape[1]),
+        state_shape_signature(state),
+    )
+    static_features = PromptFeatures(
+        speech_tokens=features.speech_tokens.clone(),
+        projected_speaker_embedding=features.projected_speaker_embedding.clone(),
+        mels=features.mels.clone(),
+    )
+    adapter._steady_npugraphs[graph_key] = _SteadyNPUGraph(
+        graph=_FakeGraph(),
+        tokens=static_tokens,
+        features=static_features,
+        input_state=static_state,
+        audio=graph_audio,
+        output_state=output_state,
+        state_signature=state_shape_signature(state),
+        prompt_mel_length=int(features.mels.shape[1]),
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda *args, **kwargs: None)
+
+    live_features = PromptFeatures(
+        speech_tokens=features.speech_tokens + 10,
+        projected_speaker_embedding=features.projected_speaker_embedding + 20,
+        mels=features.mels + 30,
+    )
+    audios, next_states = adapter.decode_batch(
+        torch.tensor([[3, 4]]),
+        live_features,
+        [state],
+        last_chunk=False,
+    )
+
+    assert _FakeGraph.calls == 1
+    assert adapter.steady_npugraph_replays == 1
+    expected_audio = float(
+        torch.tensor([[3, 4]]).sum()
+        + live_features.speech_tokens.sum()
+        + live_features.projected_speaker_embedding.sum()
+        + live_features.mels.sum()
+    )
+    assert audios[0].eq(expected_audio).all()
+    torch.testing.assert_close(static_features.speech_tokens, live_features.speech_tokens)
+    torch.testing.assert_close(
+        static_features.projected_speaker_embedding,
+        live_features.projected_speaker_embedding,
+    )
+    torch.testing.assert_close(static_features.mels, live_features.mels)
+    for cache_name in ("flow_cache", "hift_cache"):
+        original = getattr(state, cache_name)
+        result = getattr(next_states[0], cache_name)
+        for name in result:
+            torch.testing.assert_close(result[name], original[name] + 1)
+    graph_audio.zero_()
+    for cache in (output_state.flow_cache, output_state.hift_cache):
+        for tensor in cache.values():
+            tensor.zero_()
+    assert audios[0].eq(expected_audio).all()
+    assert any(tensor.count_nonzero() for tensor in next_states[0].flow_cache.values())
+
+    encoder_calls = len(token2wav.flow.encoder.calls)
+    adapter.decode_batch(
+        torch.tensor([[3, 4, 5]]),
+        features,
+        [state],
+        last_chunk=False,
+    )
+    assert _FakeGraph.calls == 1
+    assert adapter.steady_npugraph_replays == 1
+    assert len(token2wav.flow.encoder.calls) == encoder_calls + 1
+
+
 def test_model_reuses_cached_initial_state_for_default_voice() -> None:
     model, token2wav = _model(cache_initial_state=True)
 
@@ -650,6 +836,118 @@ def test_shared_runtime_prompt_recreates_missing_file_before_second_owner(tmp_pa
     model.on_requests_finished(["internal-b"])
     assert not prompt_path.exists()
     assert prompt_key not in model._runtime_prompts
+
+
+def test_bounded_runtime_prompt_cache_reuses_features_and_evicts_lru(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    model, token2wav = _model(runtime_prompt_cache_size=1)
+
+    def runtime_ref_info(request_id: str, reference: torch.Tensor):
+        info = _info(request_id, 0, [10, 11], last_chunk=True)
+        info["codes"]["ref"] = reference
+        info["meta"]["ref_audio_sr"] = 16000
+        info["meta"].pop("prompt_cache_id")
+        return info
+
+    first_reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
+    _forward(model, [runtime_ref_info("voice-a", first_reference)])
+    first_key = next(iter(model._runtime_prompts))
+    first_entry = model._runtime_prompts[first_key]
+    first_path = Path(first_entry.path)
+
+    assert token2wav.prompt_calls == 1
+    assert first_path.is_file()
+    assert first_entry.owners == set()
+
+    _forward(model, [runtime_ref_info("voice-b", first_reference.clone())])
+
+    assert token2wav.prompt_calls == 1
+    assert first_key in model._runtime_prompts
+    assert first_path.is_file()
+
+    second_reference = torch.tensor([0.0, 0.5, -0.5, 0.0])
+    _forward(model, [runtime_ref_info("voice-c", second_reference)])
+
+    assert token2wav.prompt_calls == 2
+    assert len(model._runtime_prompts) == 1
+    assert first_key not in model._runtime_prompts
+    assert not first_path.exists()
+
+
+def test_runtime_prompt_cache_reuses_immutable_initial_state(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    model, token2wav = _model(
+        runtime_prompt_cache_size=1,
+        cache_runtime_initial_state=True,
+    )
+    reference = torch.tensor([0.0, 0.25, -0.25, 0.0])
+
+    def runtime_ref_info(request_id: str):
+        info = _info(request_id, 0, [10, 11], last_chunk=True)
+        info["codes"]["ref"] = reference
+        info["meta"]["ref_audio_sr"] = 16000
+        info["meta"].pop("prompt_cache_id")
+        return info
+
+    _forward(model, [runtime_ref_info("voice-a")])
+    first_encoder_calls = len(token2wav.flow.encoder.calls)
+    _forward(model, [runtime_ref_info("voice-b")])
+
+    assert token2wav.prompt_calls == 1
+    # First request: prompt setup + live decode. Second request reuses the
+    # immutable initial flow state and executes only its live decode.
+    assert first_encoder_calls == 2
+    assert len(token2wav.flow.encoder.calls) == 3
+
+
+def test_runtime_initial_state_cache_requires_bounded_prompt_cache():
+    with pytest.raises(ValueError, match="runtime_prompt_cache_size > 0"):
+        MiniCPMO45Code2Wav(
+            vllm_config=_config(cache_runtime_initial_state=True)
+        )
+
+
+def test_runtime_prompt_preload_matches_native_trim_and_first_request(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    source_path = tmp_path / "system_ref.wav"
+    source = torch.linspace(-0.5, 0.5, 3210)
+    sf.write(source_path, source.numpy(), 16000, subtype="PCM_16")
+    model, token2wav = _model(
+        runtime_prompt_cache_size=1,
+        cache_runtime_initial_state=True,
+    )
+
+    model._preload_runtime_prompts(
+        [source_path],
+        target_sample_rate=16000,
+        frame_samples=1600,
+    )
+
+    assert token2wav.prompt_calls == 1
+    assert len(token2wav.flow.encoder.calls) == 1
+    assert len(model._runtime_prompts) == 1
+    waveform, sample_rate = model._load_reference_waveform(
+        source_path,
+        target_sample_rate=16000,
+        frame_samples=1600,
+    )
+    assert waveform.numel() == 3200
+
+    info = _info("voice-a", 0, [10, 11], last_chunk=True)
+    info["codes"]["ref"] = waveform
+    info["meta"]["ref_audio_sr"] = sample_rate
+    info["meta"].pop("prompt_cache_id")
+    _forward(model, [info])
+
+    assert token2wav.prompt_calls == 1
+    # Preload did prompt setup; the first live request only decodes its chunk.
+    assert len(token2wav.flow.encoder.calls) == 2
 
 
 def test_runtime_prompt_write_failure_does_not_publish_partial_file(tmp_path, monkeypatch):

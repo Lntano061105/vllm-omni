@@ -1,0 +1,792 @@
+#!/usr/bin/env python3
+"""Audit all official-910C, Demo, report, and source evidence before submission."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_RESULT_ROOT = REPO_ROOT / "competition/minicpmo_b/results/official_910c"
+_PROTOCOL_SCRIPT = Path(__file__).with_name("run_protocol.py")
+_PROTOCOL_SPEC = importlib.util.spec_from_file_location(
+    "minicpmo_b_run_protocol", _PROTOCOL_SCRIPT
+)
+if _PROTOCOL_SPEC is None or _PROTOCOL_SPEC.loader is None:
+    raise RuntimeError(f"cannot load protocol verifier: {_PROTOCOL_SCRIPT}")
+_PROTOCOL = importlib.util.module_from_spec(_PROTOCOL_SPEC)
+_PROTOCOL_SPEC.loader.exec_module(_PROTOCOL)
+_PAIRED_SCRIPT = Path(__file__).with_name("analyze_paired_confirmation.py")
+_PAIRED_SPEC = importlib.util.spec_from_file_location(
+    "minicpmo_b_paired_confirmation", _PAIRED_SCRIPT
+)
+if _PAIRED_SPEC is None or _PAIRED_SPEC.loader is None:
+    raise RuntimeError(f"cannot load paired verifier: {_PAIRED_SCRIPT}")
+_PAIRED = importlib.util.module_from_spec(_PAIRED_SPEC)
+_PAIRED_SPEC.loader.exec_module(_PAIRED)
+_DUPLEX_GATE_SCRIPT = Path(__file__).with_name("gate_duplex_candidate.py")
+_DUPLEX_GATE_SPEC = importlib.util.spec_from_file_location(
+    "minicpmo_b_duplex_gate", _DUPLEX_GATE_SCRIPT
+)
+if _DUPLEX_GATE_SPEC is None or _DUPLEX_GATE_SPEC.loader is None:
+    raise RuntimeError(f"cannot load duplex gate: {_DUPLEX_GATE_SCRIPT}")
+_DUPLEX_GATE = importlib.util.module_from_spec(_DUPLEX_GATE_SPEC)
+sys.modules[_DUPLEX_GATE_SPEC.name] = _DUPLEX_GATE
+_DUPLEX_GATE_SPEC.loader.exec_module(_DUPLEX_GATE)
+_ACCURACY_GATE_SCRIPT = Path(__file__).with_name("compare_accuracy_results.py")
+_ACCURACY_GATE_SPEC = importlib.util.spec_from_file_location(
+    "minicpmo_b_accuracy_gate", _ACCURACY_GATE_SCRIPT
+)
+if _ACCURACY_GATE_SPEC is None or _ACCURACY_GATE_SPEC.loader is None:
+    raise RuntimeError(f"cannot load accuracy gate: {_ACCURACY_GATE_SCRIPT}")
+_ACCURACY_GATE = importlib.util.module_from_spec(_ACCURACY_GATE_SPEC)
+_ACCURACY_GATE_SPEC.loader.exec_module(_ACCURACY_GATE)
+_ORCHESTRATOR_SCRIPT = Path(__file__).with_name("run_official_910c_retest.py")
+_ORCHESTRATOR_SPEC = importlib.util.spec_from_file_location(
+    "minicpmo_b_official_orchestrator", _ORCHESTRATOR_SCRIPT
+)
+if _ORCHESTRATOR_SPEC is None or _ORCHESTRATOR_SPEC.loader is None:
+    raise RuntimeError(f"cannot load official orchestrator: {_ORCHESTRATOR_SCRIPT}")
+_ORCHESTRATOR = importlib.util.module_from_spec(_ORCHESTRATOR_SPEC)
+sys.modules[_ORCHESTRATOR_SPEC.name] = _ORCHESTRATOR
+_ORCHESTRATOR_SPEC.loader.exec_module(_ORCHESTRATOR)
+REQUIRED_ORCHESTRATOR_PHASES = (
+    "preflight",
+    "environment",
+    "performance-baseline",
+    "performance-optimized",
+    "duplex-baseline",
+    "duplex-optimized",
+    "protocol-performance",
+    "protocol-duplex",
+    "summary-performance-c1",
+    "gate-duplex-c1",
+    "summary-performance-c4",
+    "gate-duplex-c4",
+    "summary-performance-c8",
+    "gate-duplex-c8",
+    "accuracy-daily-omni-baseline",
+    "accuracy-daily-omni-optimized",
+    "protocol-accuracy-daily-omni",
+    "gate-accuracy-daily-omni",
+    "accuracy-videomme-baseline",
+    "accuracy-videomme-optimized",
+    "protocol-accuracy-videomme",
+    "gate-accuracy-videomme",
+    "accuracy-seed-tts-baseline",
+    "accuracy-seed-tts-optimized",
+    "protocol-accuracy-seed-tts",
+    "gate-accuracy-seed-tts",
+)
+
+
+def _json(path: Path, failures: list[str]) -> dict[str, Any] | None:
+    if not path.is_file():
+        failures.append(f"missing JSON: {path}")
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        failures.append(f"invalid JSON {path}: {exc}")
+        return None
+    if not isinstance(value, dict):
+        failures.append(f"JSON root is not an object: {path}")
+        return None
+    return value
+
+
+def _passed_json(path: Path, failures: list[str]) -> dict[str, Any] | None:
+    value = _json(path, failures)
+    if value is not None and value.get("passed") is not True:
+        failures.append(f"gate did not pass: {path}")
+    return value
+
+
+def _check_protocol_pair(
+    *,
+    expected_kind: str,
+    baseline_path: Path,
+    optimized_path: Path,
+    gate_path: Path,
+    failures: list[str],
+    required_fields: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Recompute A/B provenance instead of trusting a secondary gate file."""
+    baseline = _json(baseline_path, failures)
+    optimized = _json(optimized_path, failures)
+    gate = _passed_json(gate_path, failures)
+    if baseline is None or optimized is None:
+        return None
+    result = _PROTOCOL.compare_protocols(baseline, optimized)
+    if result.get("kind") != expected_kind:
+        failures.append(
+            f"A/B protocol kind is {result.get('kind')!r}, expected {expected_kind!r}: "
+            f"{gate_path}"
+        )
+    comparison = baseline.get("comparison")
+    fields = comparison.get("fields") if isinstance(comparison, dict) else None
+    for key, expected in (required_fields or {}).items():
+        actual = fields.get(key) if isinstance(fields, dict) else None
+        if actual != expected:
+            failures.append(
+                f"A/B protocol field {key!r} is {actual!r}, expected {expected!r}: "
+                f"{gate_path}"
+            )
+    if result.get("passed") is not True:
+        details = "; ".join(str(item) for item in result.get("failures", []))
+        failures.append(f"A/B protocol verification failed for {gate_path}: {details}")
+        return None
+    if gate is not None:
+        for key in ("kind", "comparison_sha256"):
+            if gate.get(key) != result.get(key):
+                failures.append(
+                    f"protocol gate {key} does not match recomputed result: {gate_path}"
+                )
+    return baseline
+
+
+def _nonempty(path: Path, failures: list[str]) -> None:
+    if not path.is_file() or path.stat().st_size <= 0:
+        failures.append(f"missing or empty evidence file: {path}")
+
+
+def _exists(path: Path, failures: list[str]) -> None:
+    if not path.is_file():
+        failures.append(f"missing evidence file: {path}")
+
+
+def _verify_local_sha256_manifest(path: Path, failures: list[str]) -> None:
+    if not path.is_file():
+        return
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            expected, raw_name = line.split(None, 1)
+        except ValueError:
+            failures.append(f"invalid SHA256 manifest line {path}:{line_number}")
+            continue
+        target = path.parent / raw_name.strip()
+        if not target.is_file():
+            failures.append(f"SHA256 manifest target is missing: {target}")
+            continue
+        actual = hashlib.sha256(target.read_bytes()).hexdigest()
+        if actual != expected:
+            failures.append(f"SHA256 mismatch: {target}")
+
+
+def _check_environment(root: Path, failures: list[str]) -> None:
+    env = root / "environment"
+    preflight = _passed_json(env / "preflight.json", failures)
+    if preflight is not None:
+        if preflight.get("single_910c") is not True:
+            failures.append("preflight does not prove a single visible 910C")
+        selected = str(preflight.get("selected_device", 0))
+        if preflight.get("npu_processes", {}).get(selected):
+            failures.append("preflight selected NPU was occupied")
+        assets = preflight.get("asset_preflight")
+        if not isinstance(assets, dict) or assets.get("passed") is not True:
+            failures.append("preflight does not prove all model/data/evaluator assets")
+        probe = preflight.get("token2wav_asset_probe")
+        if not isinstance(probe, dict) or probe.get("passed") is not True:
+            failures.append("preflight does not prove S3Tokenizer/campplus compatibility")
+    for name in (
+        "timestamp_utc.txt",
+        "uname.txt",
+        "python_version.txt",
+        "python_packages.txt",
+        "npu_smi.txt",
+        "container_image_digest.txt",
+        "cann_version.txt",
+        "git_commit.txt",
+        "model_manifest.tsv",
+        "model_metadata_sha256.txt",
+        "model_weights_sha256.txt",
+        "seed_tts_eval_model_manifest.tsv",
+        "seed_tts_eval_model_sha256.txt",
+        "dataset_manifest.tsv",
+        "dataset_metadata_sha256.txt",
+    ):
+        _nonempty(env / name, failures)
+    _exists(env / "git_status.txt", failures)
+    for name in ("model_manifest.tsv", "seed_tts_eval_model_manifest.tsv", "dataset_manifest.tsv"):
+        path = env / name
+        if path.is_file() and "MISSING" in path.read_text(encoding="utf-8", errors="replace"):
+            failures.append(f"environment manifest contains MISSING entry: {path}")
+    digest_path = env / "container_image_digest.txt"
+    if digest_path.is_file() and not re.search(
+        r"@sha256:[0-9a-fA-F]{64}$", digest_path.read_text(encoding="utf-8").strip()
+    ):
+        failures.append("environment container image digest is not immutable sha256 form")
+    cann_path = env / "cann_version.txt"
+    if cann_path.is_file() and "not found" in cann_path.read_text(
+        encoding="utf-8", errors="replace"
+    ).lower():
+        failures.append("environment CANN version was not captured")
+
+
+def _check_orchestrator(root: Path, failures: list[str]) -> None:
+    state = root / "orchestrator_state"
+    plan = _json(state / "orchestrator_plan.json", failures)
+    expected_commands: dict[str, str] = {}
+    if plan is not None:
+        inputs = plan.get("inputs")
+        try:
+            if not isinstance(inputs, dict):
+                raise TypeError("inputs is not an object")
+            rebuilt = _ORCHESTRATOR.build_phases(
+                result_root=Path(str(inputs["result_root"])),
+                device=int(inputs["device"]),
+                port=int(inputs["port"]),
+                model_path=Path(str(inputs["model_path"])),
+                daily_omni_root=Path(str(inputs["daily_omni_root"])),
+                videomme_root=Path(str(inputs["videomme_root"])),
+                seed_tts_root=Path(str(inputs["seed_tts_root"])),
+                whisper_model=Path(str(inputs["whisper_model"])),
+                wavlm_model=Path(str(inputs["wavlm_model"])),
+                utmos_model=Path(str(inputs["utmos_model"])),
+                image_digest=str(inputs["image_digest"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            failures.append(f"orchestrator plan inputs cannot rebuild phases: {exc}")
+            rebuilt = []
+        rebuilt_names = [phase.name for phase in rebuilt]
+        if rebuilt_names != list(REQUIRED_ORCHESTRATOR_PHASES):
+            failures.append("orchestrator rebuilt phase order/count differs from required 26 phases")
+        expected_plan = _ORCHESTRATOR.build_plan(rebuilt, inputs=inputs) if rebuilt else None
+        if expected_plan is not None and plan != expected_plan:
+            failures.append("orchestrator_plan.json differs from current canonical build_phases output")
+        expected_commands = {phase.name: _ORCHESTRATOR._render(phase) for phase in rebuilt}
+    for phase in REQUIRED_ORCHESTRATOR_PHASES:
+        marker = _json(state / f"{phase}.json", failures)
+        if marker is None:
+            continue
+        if marker.get("phase") != phase:
+            failures.append(f"orchestrator marker phase mismatch: {marker}")
+        if marker.get("passed") is not True or marker.get("returncode") != 0:
+            failures.append(f"orchestrator phase did not pass: {phase}")
+        command = marker.get("command")
+        digest = marker.get("command_sha256")
+        if not isinstance(command, str) or not command:
+            failures.append(f"orchestrator phase has no command: {phase}")
+        elif not isinstance(digest, str) or digest != hashlib.sha256(command.encode()).hexdigest():
+            failures.append(f"orchestrator command hash mismatch: {phase}")
+        elif expected_commands and command != expected_commands.get(phase):
+            failures.append(f"orchestrator marker command differs from canonical plan: {phase}")
+
+
+def _check_performance(root: Path, failures: list[str]) -> None:
+    baseline = root / "official_910c_baseline"
+    optimized = root / "official_910c_optimized"
+    _check_protocol_pair(
+        expected_kind="chat-completions-performance-matrix",
+        baseline_path=baseline / "performance/run_protocol.json",
+        optimized_path=optimized / "performance/run_protocol.json",
+        gate_path=root / "protocol_gate_performance.json",
+        failures=failures,
+        required_fields={
+            "benchmark_seed": 0,
+            "num_warmups": 2,
+            "no_oversample": True,
+            "request_rate": "inf",
+            "disable_shuffle": False,
+            "c1_prompts": 32,
+            "c4_prompts": 64,
+            "c8_prompts": 128,
+        },
+    )
+    _check_protocol_pair(
+        expected_kind="realtime-duplex-speak-generation-matrix",
+        baseline_path=baseline / "duplex_rtf/run_protocol.json",
+        optimized_path=optimized / "duplex_rtf/run_protocol.json",
+        gate_path=root / "protocol_gate_duplex.json",
+        failures=failures,
+        required_fields={
+            "num_warmups": 2,
+            "turns_per_session": 1,
+            "input_chunk_ms": 200,
+            "turn_duration_ms": 0,
+            "c1_prompts": 32,
+            "c4_prompts": 64,
+            "c8_prompts": 128,
+        },
+    )
+    for concurrency, prompts in ((1, 32), (4, 64), (8, 128)):
+        suffix = f"c{concurrency}_n{prompts}"
+        duplex_results: dict[str, dict[str, Any]] = {}
+        for label, case_root in (("baseline", baseline), ("optimized", optimized)):
+            _nonempty(case_root / "performance" / "server.log", failures)
+            perf = _json(case_root / "performance" / f"seed_tts_{suffix}.json", failures)
+            if perf is not None:
+                completed = int(perf.get("completed", perf.get("successful", 0)) or 0)
+                failed = int(perf.get("failed", 0) or 0)
+                if completed != prompts or failed != 0:
+                    failures.append(
+                        f"{label} performance {suffix} incomplete: completed={completed}, failed={failed}"
+                    )
+                for metric in ("mean_ttft_ms", "mean_audio_ttfp_ms"):
+                    if not isinstance(perf.get(metric), (int, float)):
+                        failures.append(f"{label} performance {suffix} missing {metric}")
+            duplex = _json(
+                case_root / "duplex_rtf" / f"native_duplex_{suffix}.json", failures
+            )
+            if duplex is not None:
+                duplex_results[label] = duplex
+                if int(duplex.get("sessions", 0) or 0) != prompts:
+                    failures.append(f"{label} duplex {suffix} session count mismatch")
+                if int(duplex.get("audio_speak_generation_chunk_count", 0) or 0) <= 0:
+                    failures.append(f"{label} duplex {suffix} has no SPEAK-generation chunks")
+                for metric in ("ttft_ms", "ttfp_ms", "speak_generation_rtf"):
+                    summary = duplex.get(metric)
+                    if not isinstance(summary, dict) or not isinstance(summary.get("mean"), (int, float)):
+                        failures.append(f"{label} duplex {suffix} missing {metric}.mean")
+            _nonempty(case_root / "duplex_rtf" / "server.log", failures)
+        gate_path = optimized / "duplex_rtf" / f"gate_c{concurrency}.json"
+        saved_gate = _passed_json(gate_path, failures)
+        if set(duplex_results) == {"baseline", "optimized"}:
+            try:
+                recomputed = _DUPLEX_GATE.evaluate_candidate(
+                    duplex_results["baseline"],
+                    duplex_results["optimized"],
+                    _DUPLEX_GATE.PROFILES["combined"],
+                )
+            except (TypeError, ValueError) as exc:
+                failures.append(f"cannot recompute duplex gate c{concurrency}: {exc}")
+            else:
+                if recomputed.get("passed") is not True:
+                    failures.append(
+                        f"recomputed duplex gate c{concurrency} failed: "
+                        + "; ".join(str(item) for item in recomputed.get("failures", []))
+                    )
+                if saved_gate is not None:
+                    for key in ("metrics", "baseline", "candidate", "failures"):
+                        if saved_gate.get(key) != recomputed.get(key):
+                            failures.append(
+                                f"saved duplex gate c{concurrency} {key} differs from recomputation"
+                            )
+        _nonempty(root / f"performance_{suffix}.md", failures)
+
+    _passed_json(optimized / "duplex_rtf" / "activation_gate.json", failures)
+    multiturn_root = optimized / "duplex_rtf" / "multiturn_s2_t3"
+    _passed_json(multiturn_root / "multiturn_gate.json", failures)
+    multiturn = _json(multiturn_root / "native_duplex_rtf.json", failures)
+    if multiturn is not None:
+        if multiturn.get("sessions") != 2 or multiturn.get("audio_turns") != 6:
+            failures.append("optimized multi-turn raw result is not 2 sessions x 3 turns")
+        runs = multiturn.get("runs")
+        if not isinstance(runs, list) or len(runs) != 2 or not all(
+            isinstance(run, dict) and run.get("ok") is True for run in runs
+        ):
+            failures.append("optimized multi-turn raw runs are incomplete")
+
+
+def _check_accuracy(root: Path, failures: list[str]) -> None:
+    expected_absolute = {
+        "daily-omni": ("daily_omni_accuracy", "higher", 0.78),
+        "videomme": ("videomme_accuracy", "higher", 0.68),
+        "seed-tts": ("seed_tts_content_error_mean", "lower", 0.05),
+    }
+    for suite in ("daily-omni", "videomme", "seed-tts"):
+        suite_required_fields: dict[str, Any] = {
+            "benchmark_seed": 0,
+            "num_warmups": 0,
+            "no_oversample": True,
+            "request_rate": "inf",
+            "temperature": 0,
+        }
+        if suite == "daily-omni":
+            suite_required_fields.update(
+                disable_shuffle=False,
+                input_mode="all",
+                pack_mode="minicpm-interleave",
+                output_len=512,
+            )
+        elif suite == "videomme":
+            suite_required_fields.update(
+                num_prompts=2700,
+                disable_shuffle=True,
+                pack_mode="minicpm-frames",
+                max_frames=96,
+                duration="all",
+                output_len=128,
+            )
+        else:
+            suite_required_fields.update(
+                num_prompts=1000,
+                disable_shuffle=False,
+                locale="en",
+                turns_per_session=1,
+                sim_eval=1,
+                utmos_eval=1,
+            )
+        protocol = _check_protocol_pair(
+            expected_kind=f"accuracy-{suite}",
+            baseline_path=(
+                root / f"official_910c_baseline/accuracy/{suite}/run_protocol.json"
+            ),
+            optimized_path=(
+                root / f"official_910c_optimized/accuracy/{suite}/run_protocol.json"
+            ),
+            gate_path=root / f"protocol_gate_accuracy_{suite}.json",
+            failures=failures,
+            required_fields=suite_required_fields,
+        )
+        protocol_fields = (
+            protocol.get("comparison", {}).get("fields", {})
+            if isinstance(protocol, dict)
+            else {}
+        )
+        expected_requests = protocol_fields.get("num_prompts")
+        if not isinstance(expected_requests, int) or expected_requests <= 0:
+            failures.append(f"{suite} protocol has no positive integer num_prompts")
+            expected_requests = None
+        protocol_trees = (
+            protocol.get("comparison", {}).get("trees", {})
+            if isinstance(protocol, dict)
+            else {}
+        )
+        protocol_files = (
+            protocol.get("comparison", {}).get("files", {})
+            if isinstance(protocol, dict)
+            else {}
+        )
+        if suite == "seed-tts":
+            for key in ("whisper_model", "wavlm_model"):
+                if key not in protocol_trees:
+                    failures.append(f"Seed-TTS protocol is missing evaluator tree: {key}")
+            if "utmos_model" not in protocol_files:
+                failures.append("Seed-TTS protocol is missing evaluator file: utmos_model")
+        gate_path = root / f"accuracy_gate_{suite}.json"
+        gate = _passed_json(gate_path, failures)
+        if gate is not None and gate.get("max_regression") != 0.02:
+            failures.append(f"{suite} gate does not use the required 2pp threshold")
+        if gate is not None:
+            metric, direction, threshold = expected_absolute[suite]
+            absolute = gate.get("absolute_gate")
+            if absolute != {"metric": metric, "direction": direction, "threshold": threshold}:
+                failures.append(f"{suite} gate does not prove the absolute accuracy threshold")
+        accuracy_results: dict[str, dict[str, Any]] = {}
+        for label in ("baseline", "optimized"):
+            case = root / f"official_910c_{label}" / "accuracy" / suite
+            _passed_json(case / "activation_gate.json", failures)
+            matches = sorted(case.glob("seed_tts_quality_resumed*.json")) or sorted(
+                case.glob("qwen_omni_acc_*.json")
+            ) + sorted(case.glob("omni_acc_videomme_*.json"))
+            if len(matches) != 1:
+                failures.append(
+                    f"expected exactly one final {suite} result for {label}, found {len(matches)} under {case}"
+                )
+            else:
+                result = _json(matches[0], failures)
+                if result is None:
+                    continue
+                accuracy_results[label] = result
+                if suite == "seed-tts":
+                    if result.get("seed_tts_quality_complete") is not True:
+                        failures.append(f"{label} Seed-TTS quality result is incomplete")
+                    if expected_requests is not None:
+                        for key in (
+                            "seed_tts_session_count",
+                            "seed_tts_turn_count",
+                            "seed_tts_content_evaluated",
+                            "seed_tts_sim_evaluated",
+                            "seed_tts_utmos_evaluated",
+                        ):
+                            if int(result.get(key, 0) or 0) != expected_requests:
+                                failures.append(
+                                    f"{label} Seed-TTS {key}={result.get(key)!r}, "
+                                    f"expected={expected_requests} from protocol"
+                                )
+                else:
+                    prefix = "daily_omni" if suite == "daily-omni" else "videomme"
+                    completed = int(result.get("completed", 0) or 0)
+                    evaluated = int(result.get(f"{prefix}_evaluated", 0) or 0)
+                    evaluated_ok = int(result.get(f"{prefix}_evaluated_ok", 0) or 0)
+                    expected = expected_requests
+                    if expected is None:
+                        continue
+                    if expected <= 0 or completed != expected:
+                        failures.append(
+                            f"{label} {suite} completed={completed}, expected={expected}"
+                        )
+                    if evaluated != expected or evaluated_ok != expected:
+                        failures.append(
+                            f"{label} {suite} evaluated={evaluated}, "
+                            f"evaluated_ok={evaluated_ok}, expected={expected}"
+                        )
+                    for key in (
+                        "failed",
+                        f"{prefix}_request_failed",
+                        f"{prefix}_parse_failed",
+                    ):
+                        if int(result.get(key, 0) or 0) != 0:
+                            failures.append(f"{label} {suite} {key} is not zero")
+        if set(accuracy_results) == {"baseline", "optimized"} and expected_requests is not None:
+            recomputed = _ACCURACY_GATE.compare_accuracy(
+                suite,
+                accuracy_results["baseline"],
+                accuracy_results["optimized"],
+                max_regression=0.02,
+                expected_requests=expected_requests,
+            )
+            if recomputed.get("passed") is not True:
+                failures.append(
+                    f"recomputed accuracy gate {suite} failed: "
+                    + "; ".join(str(item) for item in recomputed.get("failures", []))
+                )
+            if gate is not None:
+                for key in (
+                    "suite",
+                    "metrics",
+                    "max_regression",
+                    "expected_requests",
+                    "absolute_gate",
+                    "failures",
+                ):
+                    if gate.get(key) != recomputed.get(key):
+                        failures.append(
+                            f"saved accuracy gate {suite} {key} differs from recomputation"
+                        )
+
+
+def _check_demo(demo_root: Path, failures: list[str]) -> None:
+    manifest = _json(demo_root / "demo_evidence.json", failures)
+    if manifest is None:
+        return
+    if manifest.get("official_910c") is not True:
+        failures.append("Demo evidence is not marked official_910c=true")
+    for key in (
+        "service_exit_clean",
+    ):
+        if manifest.get(key) is not True:
+            failures.append(f"Demo {key} is not true")
+    for key in (
+        "unexpected_error_count",
+        "audio_interruption_count",
+        "empty_audio_packet_count",
+    ):
+        if manifest.get(key) != 0:
+            failures.append(f"Demo {key}={manifest.get(key)!r}, expected 0")
+    for key in ("started_utc", "finished_utc"):
+        value = manifest.get(key)
+        if not isinstance(value, str) or not value or value == "REPLACE_ME":
+            failures.append(f"Demo {key} is not populated")
+    if not isinstance(manifest.get("continuous_run_minutes"), (int, float)) or manifest["continuous_run_minutes"] <= 0:
+        failures.append("Demo continuous_run_minutes must be positive")
+    scenarios = manifest.get("scenarios")
+    for name in ("text", "audio", "video", "text_audio"):
+        if not isinstance(scenarios, dict) or not isinstance(scenarios.get(name), dict):
+            failures.append(f"Demo scenario is missing: {name}")
+        elif scenarios[name].get("passed") is not True:
+            failures.append(f"Demo scenario did not pass: {name}")
+    for key in ("service_log", "video_file"):
+        raw = manifest.get(key)
+        if not isinstance(raw, str) or not raw or raw == "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT":
+            failures.append(f"Demo {key} is not populated")
+        else:
+            path = (demo_root / raw).resolve()
+            try:
+                path.relative_to(demo_root.resolve())
+            except ValueError:
+                failures.append(f"Demo {key} escapes demo root: {raw}")
+            else:
+                _nonempty(path, failures)
+
+
+def _check_source(source_root: Path, failures: list[str]) -> None:
+    for name in (
+        "source_snapshot.tar.gz",
+        "optimization.patch",
+        "git_commit.txt",
+        "git_base_commit.txt",
+        "source_sha256.txt",
+        "artifact_metadata.json",
+        "artifact_sha256.txt",
+        "submission_package_audit.json",
+    ):
+        _nonempty(source_root / name, failures)
+    _exists(source_root / "git_status.txt", failures)
+    metadata = _json(source_root / "artifact_metadata.json", failures)
+    if metadata is not None:
+        if metadata.get("final_candidate") is not True or metadata.get("dirty_worktree") is not False:
+            failures.append("source artifact metadata is not a clean final candidate")
+    audit = _passed_json(source_root / "submission_package_audit.json", failures)
+    if audit is not None and audit.get("warnings"):
+        failures.append("source submission package audit contains warnings")
+    _verify_local_sha256_manifest(source_root / "artifact_sha256.txt", failures)
+
+
+def _check_package(package_root: Path, failures: list[str]) -> None:
+    archive = package_root / "minicpmo_b_official_910c.tar.gz"
+    verification = _passed_json(package_root / "archive_verification.json", failures)
+    _nonempty(archive, failures)
+    _nonempty(package_root / "archive_sha256.txt", failures)
+    if verification is not None:
+        actual = hashlib.sha256(archive.read_bytes()).hexdigest() if archive.is_file() else None
+        if actual != verification.get("archive_sha256"):
+            failures.append("final submission archive SHA256 does not match verification JSON")
+        if not isinstance(verification.get("evidence_file_count"), int) or verification[
+            "evidence_file_count"
+        ] <= 0:
+            failures.append("final submission archive contains no evidence files")
+    manifest = package_root / "archive_sha256.txt"
+    if manifest.is_file() and archive.is_file():
+        expected_line = f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}"
+        if manifest.read_text(encoding="utf-8").strip() != expected_line:
+            failures.append("archive_sha256.txt does not match final submission archive")
+
+
+def _check_optional_paired_confirmation(root: Path, failures: list[str]) -> None:
+    paired = root / "paired_confirmation"
+    if not paired.exists():
+        return
+    protocol_fields = {
+        "num_warmups": 2,
+        "turns_per_session": 1,
+        "input_chunk_ms": 200,
+        "turn_duration_ms": 0,
+        "c1_prompts": 32,
+        "c4_prompts": 64,
+        "c8_prompts": 128,
+    }
+    a1 = root / "official_910c_baseline/duplex_rtf/run_protocol.json"
+    b1 = root / "official_910c_optimized/duplex_rtf/run_protocol.json"
+    a2 = paired / "baseline_a2/duplex_rtf/run_protocol.json"
+    b2 = paired / "optimized_b2/duplex_rtf/run_protocol.json"
+    for baseline_path, optimized_path, gate_name in (
+        (a1, a2, "protocol_gate_baseline_repeat.json"),
+        (b1, b2, "protocol_gate_optimized_repeat.json"),
+        (a2, b2, "protocol_gate_second_pair.json"),
+    ):
+        _check_protocol_pair(
+            expected_kind="realtime-duplex-speak-generation-matrix",
+            baseline_path=baseline_path,
+            optimized_path=optimized_path,
+            gate_path=paired / gate_name,
+            failures=failures,
+            required_fields=protocol_fields,
+        )
+    saved_gate = _passed_json(paired / "paired_confirmation_gate.json", failures)
+    for variant in ("baseline_a2", "optimized_b2"):
+        case = paired / variant / "duplex_rtf"
+        _json(case / "run_protocol.json", failures)
+        _nonempty(case / "server.log", failures)
+        result = _json(case / "native_duplex_c1_n32.json", failures)
+        if result is not None:
+            if int(result.get("sessions", 0) or 0) != 32:
+                failures.append(f"paired confirmation {variant} is not 32 sessions")
+            runs = result.get("runs")
+            if not isinstance(runs, list) or len(runs) != 32 or not all(
+                isinstance(run, dict) and run.get("ok") is True for run in runs
+            ):
+                failures.append(f"paired confirmation {variant} runs are incomplete")
+    raw_paths = (
+        root / "official_910c_baseline/duplex_rtf/native_duplex_c1_n32.json",
+        root / "official_910c_optimized/duplex_rtf/native_duplex_c1_n32.json",
+        paired / "optimized_b2/duplex_rtf/native_duplex_c1_n32.json",
+        paired / "baseline_a2/duplex_rtf/native_duplex_c1_n32.json",
+    )
+    raw = [_json(path, failures) for path in raw_paths]
+    if all(isinstance(item, dict) for item in raw):
+        recomputed = _PAIRED.evaluate(*raw)
+        if recomputed.get("passed") is not True:
+            failures.append(
+                "paired confirmation recomputation failed: "
+                + "; ".join(str(item) for item in recomputed.get("failures", []))
+            )
+        if saved_gate is not None:
+            for key in ("method", "max_repeat_drift_pct", "metrics"):
+                if saved_gate.get(key) != recomputed.get(key):
+                    failures.append(
+                        f"paired confirmation saved gate {key} differs from recomputation"
+                    )
+
+
+def audit(
+    *,
+    result_root: Path,
+    demo_root: Path,
+    source_root: Path,
+    report: Path,
+    require_package: bool = False,
+) -> dict[str, Any]:
+    failures: list[str] = []
+    _check_environment(result_root, failures)
+    _check_orchestrator(result_root, failures)
+    _check_performance(result_root, failures)
+    _check_accuracy(result_root, failures)
+    _check_optional_paired_confirmation(result_root, failures)
+    _check_demo(demo_root, failures)
+    _check_source(source_root, failures)
+    if require_package:
+        _check_package(result_root / "final_submission/package", failures)
+    _nonempty(report, failures)
+    if report.is_file():
+        report_text = report.read_text(encoding="utf-8", errors="replace")
+        if "待填写" in report_text:
+            failures.append(f"final report still contains 待填写 placeholders: {report}")
+        for heading in (
+            "## 环境与版本",
+            "## 原始性能瓶颈分析",
+            "## 最终优化方法",
+            "## TTFT / TTFP（Chat Completions 辅助矩阵）",
+            "## 官方目标口径：Realtime SPEAK 生成阶段",
+            "## 精度准入",
+            "## 稳定性、Activation 与 Demo",
+            "## 资源使用与异常说明",
+            "## 完整复现步骤",
+            "## 复现与制品",
+        ):
+            if heading not in report_text:
+                failures.append(f"final report is missing required section: {heading}")
+    return {
+        "passed": not failures,
+        "official_910c_evidence": True,
+        "result_root": str(result_root),
+        "demo_root": str(demo_root),
+        "source_root": str(source_root),
+        "report": str(report),
+        "package_required": require_package,
+        "failure_count": len(failures),
+        "failures": failures,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--result-root", type=Path, default=DEFAULT_RESULT_ROOT)
+    parser.add_argument("--demo-root", type=Path)
+    parser.add_argument("--source-root", type=Path)
+    parser.add_argument("--report", type=Path)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--require-package",
+        action="store_true",
+        help="Also verify the already-built final submission archive.",
+    )
+    args = parser.parse_args()
+    result_root = args.result_root.expanduser().resolve()
+    result = audit(
+        result_root=result_root,
+        demo_root=(args.demo_root or result_root / "demo").expanduser().resolve(),
+        source_root=(args.source_root or result_root / "final_submission/source").expanduser().resolve(),
+        report=(args.report or result_root / "final_submission/FINAL_REPORT.md").expanduser().resolve(),
+        require_package=args.require_package,
+    )
+    rendered = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+    print(rendered)
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered + "\n", encoding="utf-8")
+    return 0 if result["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

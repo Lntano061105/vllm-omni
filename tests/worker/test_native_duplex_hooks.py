@@ -786,6 +786,83 @@ def test_minicpmo_stage0_loaded_processor_validates_special_tokens(monkeypatch):
     }
 
 
+def test_minicpmo_stage0_reference_embedding_cache_is_content_addressed_and_bounded():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(
+        MiniCPMO45Stage0DuplexRuntime
+    )
+    runtime._ref_audio_embedding_cache_size = 1
+    runtime._ref_audio_embedding_cache = {}
+    runtime._can_cache_stage_ref_audio_embeddings = lambda: True
+    calls: list[bytes] = []
+
+    def compute(ref_audio, *, state=None):
+        del state
+        waveform = np.asarray(ref_audio, dtype=np.float32)
+        calls.append(waveform.tobytes())
+        return torch.tensor([[float(waveform.sum())]])
+
+    runtime._compute_stage_ref_audio_embeddings = compute
+    first = np.array([0.0, 0.25, -0.25], dtype=np.float32)
+    second = np.array([0.0, 0.5, -0.5], dtype=np.float32)
+
+    first_result = runtime._stage_ref_audio_embeddings(first)
+    cached_result = runtime._stage_ref_audio_embeddings(first.copy())
+
+    assert len(calls) == 1
+    assert cached_result.data_ptr() == first_result.data_ptr()
+
+    runtime._stage_ref_audio_embeddings(second)
+    runtime._stage_ref_audio_embeddings(first)
+
+    assert len(calls) == 3
+    assert len(runtime._ref_audio_embedding_cache) == 1
+
+
+def test_minicpmo_stage0_reference_cache_reads_hf_runtime_override():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    stage_model = SimpleNamespace(
+        processor=SimpleNamespace(tokenizer=_minicpmo45_tokenizer_stub()),
+        config=SimpleNamespace(
+            minicpmo45_runtime_config={
+                "stage0_ref_audio_embedding_cache_size": 4,
+            }
+        ),
+    )
+
+    runtime = MiniCPMO45Stage0DuplexRuntime(stage_model, device="cpu")
+
+    assert runtime._ref_audio_embedding_cache_size == 4
+
+
+def test_minicpmo_stage0_reference_preload_uses_runtime_normalized_waveform(tmp_path):
+    import soundfile as sf
+
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    prompt = tmp_path / "voice.wav"
+    waveform = np.linspace(-0.5, 0.5, 3210, dtype=np.float32)
+    sf.write(prompt, waveform, 16000)
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.model_path = str(tmp_path)
+    runtime._ref_audio_embedding_cache_size = 1
+    seen: list[np.ndarray] = []
+    runtime._stage_ref_audio_embeddings = lambda value: seen.append(np.asarray(value).copy())
+
+    runtime.preload_ref_audio_embeddings("voice.wav", frame_samples=1600)
+
+    assert len(seen) == 1
+    assert seen[0].shape == (3200,)
+
+
 def test_minicpmo_stage0_data_plane_prefill_matches_official_unit_format():
     import torch
 
@@ -2628,3 +2705,150 @@ def test_ar_runner_applies_duplex_sampling_before_the_model_sampler(class_name: 
         f"{_MODEL_SAMPLER_CALL}() at line {sampler_lineno}.  The hook masks the logits and publishes the "
         f"row -> session map the sampler reads, so running it afterwards is a silent no-op."
     )
+
+
+def test_npu_talker_local_slot_mapping_has_cpu_fast_path_and_gpu_fallback():
+    """The local decode fast path must stay optional and fail-safe."""
+    import ast
+
+    classdef, path = _ar_runner_classdefs()["NPUARModelRunner"]
+    helper = next(
+        node
+        for node in classdef.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_try_talker_cpu_slot_mapping"
+    )
+    direct = next(
+        node
+        for node in classdef.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_update_direct_talker_slot_mapping"
+    )
+    prepare = next(
+        node
+        for node in classdef.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_prepare_inputs"
+    )
+    helper_calls = _method_calls(helper)
+    direct_calls = _method_calls(direct)
+    prepare_calls = _method_calls(prepare)
+    assert "compute_slot_mapping_draft" in helper_calls, (
+        f"{path} must use the CPU draft slot calculator for runner-local decode"
+    )
+    assert "compute_slot_mapping" in direct_calls, (
+        f"{path} must retain the standard GPU slot-mapping fallback"
+    )
+    assert "_try_talker_cpu_slot_mapping" in prepare_calls, (
+        f"{path} must cover the scheduler-visible pure-decode step as well"
+    )
+
+
+def test_npu_talker_graph_sampler_refreshes_history_before_every_local_forward():
+    import ast
+
+    classdef, path = _ar_runner_classdefs()["NPUARModelRunner"]
+    execute = next(
+        node
+        for node in classdef.body
+        if isinstance(node, ast.FunctionDef) and node.name == "execute_model"
+    )
+    refresh_lines = [
+        node.lineno
+        for node in ast.walk(execute)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_prepare_talker_graph_sampler_inputs"
+    ]
+    assert len(refresh_lines) >= 2, (
+        f"{path} must refresh graph-sampler history for the initial and local forwards"
+    )
+
+
+def test_npu_talker_graph_sampler_uses_cpugpubuffer_tensor_views():
+    """Graph sampler state is a CpuGpuBuffer, not a Tensor itself."""
+    import ast
+
+    classdef, path = _ar_runner_classdefs()["NPUARModelRunner"]
+    methods = {
+        node.name: node
+        for node in classdef.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    init_source = ast.unparse(methods["__init__"])
+    prepare_source = ast.unparse(methods["_prepare_talker_graph_sampler_inputs"])
+    execute_source = ast.unparse(methods["execute_model"])
+
+    assert "self.talker_codec_history.cpu.fill_(-1)" in init_source, (
+        f"{path} must initialize the CpuGpuBuffer CPU tensor before copying it"
+    )
+    assert "self.talker_codec_history.copy_to_gpu()" in init_source, (
+        f"{path} must publish the initialized history to the device tensor"
+    )
+    assert "self.talker_codec_eos_allowed.cpu.fill_(False)" in init_source
+    assert "self.talker_codec_eos_allowed.copy_to_gpu()" in init_source
+    assert "self.talker_codec_history.gpu[row]" in prepare_source, (
+        f"{path} must refresh the device history Tensor, not subscript CpuGpuBuffer"
+    )
+    assert "self.talker_codec_eos_allowed.gpu[row]" in prepare_source, (
+        f"{path} must update the device EOS Tensor, not subscript CpuGpuBuffer"
+    )
+    assert "graph_sampler_rows" in execute_source
+    assert "self.talker_codec_history.gpu[:graph_sampler_rows]" in execute_source
+    assert "self.talker_codec_eos_allowed.gpu[:graph_sampler_rows]" in execute_source
+
+
+def test_npu_talker_local_graph_head_uses_local_decode_rows():
+    """Runner-local replay must not reuse scheduler-visible logit indices."""
+    import ast
+
+    classdef, path = _ar_runner_classdefs()["NPUARModelRunner"]
+    execute = next(
+        node
+        for node in classdef.body
+        if isinstance(node, ast.FunctionDef) and node.name == "execute_model"
+    )
+    source = ast.unparse(execute)
+
+    assert "cudagraph_mode == CUDAGraphMode.FULL" in source
+    assert "omni_num_sample_rows" in source, (
+        f"{path} must use a static packed-row slice for FULL replay"
+    )
+    assert "local_graph_head_kwargs = dict(graph_head_kwargs)" in source
+    assert (
+        "self.query_start_loc.gpu[1:num_reqs + 1] - 1" in source
+    ), f"{path} must derive graph-head indices from runner-local decode rows"
+    assert "**local_graph_head_kwargs" in source, (
+        f"{path} must pass the runner-local graph-head kwargs to local replay"
+    )
+
+
+def test_npu_full_graph_capture_includes_graph_sampler_inputs():
+    """Capture and replay must select the same Talker forward branch."""
+    import ast
+
+    root = _repo_root()
+    path = root / "vllm_omni/platforms/npu/worker/npu_model_runner.py"
+    module = ast.parse(path.read_text())
+    classdef = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "OmniNPUModelRunner"
+    )
+    dummy_run = next(
+        node
+        for node in classdef.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_dummy_run"
+    )
+    source = ast.unparse(dummy_run)
+
+    assert "_talker_graph_sampler" in source
+    assert "omni_codec_history" in source
+    assert "omni_codec_eos_allowed" in source
+    assert "talker_codec_history" in source
+    assert "talker_codec_eos_allowed" in source
+    assert "torch.full" not in source
+    assert "dummy_model_kwargs['omni_codec_history'] = history.gpu[:num_reqs_padded]" in source
+    assert (
+        "dummy_model_kwargs['omni_codec_eos_allowed'] = "
+        "eos_allowed.gpu[:num_reqs_padded]"
+    ) in source

@@ -1,0 +1,35 @@
+# Combined exact Stage-1 hot-path candidate on physical NPU 5.
+#
+# 1. Compute all pure single-token KV slots directly from the CPU block table.
+# 2. Put codec projection, sparse fixed-window repetition penalty and an exact
+#    compact reconstruction of Top-P -> Top-K inside the existing FULL graph.
+#
+# The codec categorical distribution is preserved; only torch.multinomial over
+# the compact candidate set remains outside the graph. The deterministic binary
+# engine continue/stop row bypasses the generic sampler. This configuration is
+# experimental and must pass activation, performance, Seed-TTS and Demo gates.
+base_config: minicpmo_4_5_duplex_euler_local4_zero_wait_npu5.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      code2wav_cache_initial_state: true
+      code2wav_cross_prompt_batching: true
+      code2wav_prewarm: true
+      token2wav_cfg_mode: conditional
+      token2wav_solver: euler
+      token2wav_n_timesteps: 1
+      token2wav_remove_hift_weight_norm: true
+      talker_emit_codec_chunks: true
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 50
+      codec_left_context_frames: 3
+      talker_local_decode_stage_id: 1
+      talker_local_decode_steps: 4
+      talker_local_cpu_slot_mapping: true
+      talker_graph_sampler: true
+      talker_binary_argmax: true

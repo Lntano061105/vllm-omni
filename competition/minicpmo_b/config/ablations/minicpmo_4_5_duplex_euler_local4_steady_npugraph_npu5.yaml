@@ -1,0 +1,34 @@
+# Experimental Stage-2 steady Token2Wav NPUGraph on physical NPU 5.
+# Capture is restricted to the single-request, non-terminal, exact-shape
+# 53-token steady path. All first/tail/dynamic/batched work falls back eager.
+base_config: minicpmo_4_5_duplex_euler_local4_zero_wait_npu5.yaml
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      code2wav_cache_initial_state: true
+      code2wav_cross_prompt_batching: true
+      code2wav_prewarm: true
+      token2wav_cfg_mode: conditional
+      token2wav_solver: euler
+      token2wav_n_timesteps: 1
+      token2wav_remove_hift_weight_norm: true
+      token2wav_steady_npugraph: true
+      # The native duplex evaluator sends this 16.84 s reference instead of
+      # the 6.02 s HT default, so capture both stable prompt-cache shapes.
+      code2wav_npugraph_prompt_wavs:
+        - assets/system_ref_audio.wav
+      # Match native duplex normalization: 16 kHz mono and trim to whole
+      # 100 ms / 1600-sample embeddings before hashing and prompt encoding.
+      code2wav_npugraph_prompt_sample_rate: 16000
+      code2wav_npugraph_prompt_frame_samples: 1600
+      talker_emit_codec_chunks: true
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 50
+      codec_left_context_frames: 3
+      talker_local_decode_stage_id: 1
+      talker_local_decode_steps: 4

@@ -1,0 +1,10 @@
+# Batch native silence only after the first audio packet.  LISTEN keeps the
+# official one-second cadence for TTFT/TTFP; SPEAK uses two-unit appends to
+# reduce repeated Stage-0 and orchestration overhead in steady-state audio.
+base_config: minicpmo_4_5_duplex_full_decode_local2_euler_npu5.yaml
+pipeline: minicpmo_4_5
+
+duplex_session:
+  native_silence_continuation_delay_ms: 0
+  native_silence_continuation_units_per_append: 2
+  native_silence_batch_after_first_audio_only: true

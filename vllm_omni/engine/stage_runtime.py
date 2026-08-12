@@ -374,6 +374,16 @@ class StageRuntime:
                     stage_connector_spec=stage_connector_spec,
                     cli_tokenizer=self._tokenizer,
                 )
+                mm_cache_gb = engine_args_dict.get("mm_processor_cache_gb")
+                if mm_cache_gb is not None:
+                    state = "disabled" if float(mm_cache_gb) <= 0 else "enabled"
+                    logger.info(
+                        "[stage_init] Stage %d multimodal processor cache: %s "
+                        "(mm_processor_cache_gb=%s)",
+                        stage_id,
+                        state,
+                        mm_cache_gb,
+                    )
                 inject_omni_kv_connector_config(
                     engine_args_dict,
                     omni_kv_connector,

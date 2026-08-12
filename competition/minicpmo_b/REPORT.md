@@ -38,6 +38,24 @@
 | O24 | Prompt shape bucket + 多 shape 启动预热 | 尝试消除不同参考音频的 Conformer 首次 shape 成本 | 低 | 淘汰：c4 TTFP 仍为 12.35 s，chunk RTF 恶化至 0.5272 |
 | O25 | Ascend fused relative attention / CPU Conformer | 降低新 shape 编译成本或绕过 NPU 冷启动 | 中 | 淘汰：fused 稳态 RTF 约回退 9%；CPU BF16 encoder 约 6.66 s/chunk |
 | O26 | 取消 native silence continuation 的墙钟 pacing | 保留送入模型的 1 秒静音 payload，仅取消每轮默认 1000 ms 人工等待 | 低 | 当前 910B4 最佳：TTFT/TTFP -38.82%，官方口径 SPEAK RTF -62.93% |
+| O27 | Duplex Talker runner-local decode ×4 | 进一步减少 Stage 1 scheduler/IPC 往返与同卡竞争 | 低 | 晋级候选：相对 local2，SPEAK RTF mean -3.42%、p99 -9.80% |
+| O28 | Duplex Talker runner-local decode ×8 | 探索更长本地窗口的调度收益上限 | 低 | RTF 候选：相对 local2 mean -5.02%，但 TTFT/TTFP +0.68% |
+| O29 | local4 + fused Token2Wav encoder attention | 正交合并 Stage 1 调度与 Stage 2 首响优化 | 低 | TTFT/TTFP 新低，但 RTF mean/p99 回退，降级为首响专项候选 |
+| O30 | Token2Wav Flow BF16 | 验证昇腾低精度 Flow 是否降低 Stage 2 时延 | 中 | 淘汰：TTFT/TTFP +1.51%，SPEAK RTF mean +1.58%、p99 +9.61% |
+| O31 | local decode attention metadata 复用 | 消除 runner-local 每 token metadata builder/H2D | 中 | 淘汰并回滚：ACLGraph replay 后首包超时，metadata 含未显式逐步状态 |
+| O32 | local64 + fused encoder + continuation 2× | 叠加三个独立热点优化，探索大幅 RTF 收益 | 中 | 淘汰：组合后首包超时，不能简单正交叠加 |
+| O33 | Talker codec sampler 独立 ACLGraph | 图内执行 head、repetition、候选过滤和 softmax | 中 | 淘汰并回滚：微基准 3.16–4.13×，但与 Stage 1 FULL_DECODE_ONLY 共存时首次请求停滞 |
+| O34 | Top-K-first 精确 Top-P compact sampler | 消除 6562 维全排序与 dense multinomial，保持原请求级 RNG | 中 | 淘汰并回滚：微基准 1.79×，但 FULL_DECODE_ONLY 首次请求同样停滞 |
+| O35 | Stage 1 图内 decode-only `head_code` | 只投影 runner 选中的采样行，并入已有模型图 | 中 | 第二版固定驻留 buffer 待 NPU smoke；默认关闭 |
+| O36 | Stage 2 稳态整链 NPUGraph | 捕获 53-token 稳态 Conformer + CFM + HiFT，消除 eager 小算子下发 | 中 | 已完成筛选工具及默认关闭的生产实现；Code2Wav CPU 47/47 通过，待物理 NPU 5 数值与性能门禁 |
+| O37 | 有界 runtime reference 特征/初始 state 缓存 | 相同参考音频跨请求复用 S3Tokenizer、speaker embedding、prompt features、Conformer/CFM 初始 cache | 低 | 默认关闭的 LRU+启动预载候选；CPU 生命周期/复用/淘汰 47/47 通过，待 NPU 5 TTFT/TTFP A/B |
+| O38 | Stage 0 reference embedding 缓存 | 相同参考音频跨会话复用 APM/音频塔 reference embeddings | 低 | 仅缓存无 session state 的直接 encoder 路径；native duplex hooks 64/64 通过，随 O37 做 TTFT/TTFP A/B |
+| O39 | 候选性能与 activation 机器门禁 | 只用 SPEAK 生成 RTF，并强制验证图/缓存真实命中及 fatal 日志 | 低 | 5/5 单测通过；已接入 README 与官方 910C 复测流程 |
+| O40 | 全纯 decode CPU slot mapping | 用 CPU block table 直接计算 scheduler-visible 与 runner-local 单 token KV slot，跳过全尺寸 NPU slot kernel | 低 | 默认关闭；精确计算并保留 GPU 自动回退，待物理 NPU 5 A/B |
+| O41 | FULL graph 内 exact compact codec sampler | 图内 16 槽稀疏 repetition + Top-K/全局 logsumexp 精确重建 Top-P→Top-K，消除 AI-CPU Bincount 和全词表 sort/scatter | 低 | 默认关闭；CPU 分布等价、循环历史与请求压缩测试通过，待 NPU 5 graph smoke/性能/精度门禁 |
+| O42 | Talker 二元控制 argmax | codec 已在模型内采样后，直接对确定性的 continue/stop 二元行 argmax，绕过通用 temperature/top-k/top-p sampler | 低 | 随 O41 组合默认关闭；logprobs/allowed IDs/bad words/penalty 自动回退通用 sampler，待 NPU 5 A/B |
+| O43 | Stage 0 禁用双进程多模态 LRU | 避免 API sender 与 Engine receiver 在并发/重试/失败请求后出现淘汰顺序分叉，消除长稳 `Expected a cached item` 故障 | 无模型精度风险 | 已进入默认 910C 与 NPU 5 验证 YAML；Daily-Omni 1196/1196、Video-MME 2700/2700 均零请求/解析失败且 fatal gate 通过 |
+| O44 | Stage 2 NPUGraph 完整条件回灌 | replay 前同时刷新 codec、speech token、speaker embedding、mel 与 recurrent cache，避免同 shape 不同参考音频误用捕获条件 | 无（修复实验路径正确性） | 定向 CPU replay 单测通过；新增 fixed-13/25 当前最佳候选上的单变量 NPU 5 ablation，待性能与数值门禁 |
 
 ## 3. 性能结果
 
@@ -245,7 +263,176 @@ duplex_session:
 终止标点、完整音频与 transcript 检查全部通过。原始结果：
 `results/candidates/euler_local2_zero_silence_wait_npu5_n4_v1/result.json`。
 
-同一候选先通过 Seed-TTS 三条本地 Whisper 小门禁（mean/median WER=0），随后
+在完全相同的 Euler、zero-wait、50 帧音频 chunk 配置上，仅将 Talker
+runner-local decode 从 2 步扩大到 4 步，4/4 请求仍生成 4 个音频包和
+3.72 s 完整音频，错误数为 0，transcript、终止事件和连续性检查全部通过。
+TTFT/TTFP mean 为 1867.819/1867.497 ms，SPEAK RTF mean/median/p99 为
+0.761914/0.772574/0.812804。相对 local2，TTFT/TTFP 改善约 1.22%，SPEAK
+RTF mean 改善 3.42%，p99 改善 9.80%。这说明更长的 runner-local 窗口在
+full-duplex 同卡竞争下确实能减少 Host 往返和尾延迟；该候选保留并继续与
+continuation 合并路线做正交验证。原始结果：
+`results/candidates/euler_local4_zero_wait_npu5_n4_v1/result.json`。
+
+local4 随后通过两项独立准入门禁。Seed-TTS 10 条结果为 10/10 请求成功，
+mean/median WER=0.0253/0，请求失败、空 PCM 和 ASR/WER 失败均为 0，流式
+连续率 100%；原始结果位于
+`results/candidates/euler_local4_zero_wait_seed_tts_acc_n10_v1/`。native duplex
+2 会话 × 每会话 3 轮测试也得到 6/6 音频轮成功、错误数 0、无 stale audio、
+重复 speak、跨轮污染或生命周期异常；TTFT/TTFP mean 为
+1994.442/1994.209 ms，22 个 SPEAK chunk 的 mean/median/p99 RTF 为
+0.750323/0.771753/0.873893。原始结果位于
+`results/candidates/euler_local4_zero_wait_multiturn_s2_t3_v1/result.json`。
+因此 local4 已晋级为当前单卡 910C 三指标均衡默认，最终仍需官方 910C 完整集
+复测。
+
+### 当前晋级候选：固定 13/25 包 + reference/runner 启动预热
+
+在 local4、CPU slot mapping、graph sampler 和 binary argmax 组合上，进一步把
+非尾部 Code2Wav 调用固定为首包 13 帧、稳态 25 帧，并将官方参考音频的 Stage 0
+embedding、Stage 2 prompt/initial state 与完整 Code2Wav runner 13/25 实形状执行
+迁移到服务启动期。最终 Thinker turn-end 的精确余量仍单独 flush，并由
+`speak_tail=true` 排除在官方 SPEAK 生成阶段 RTF 之外。
+
+物理 NPU 5、端口 8095、并发 1、1 次预热 + 4 次正式请求的同周期结果如下：
+
+| 指标 | local4 同周期基线 | 13/25 + runner prewarm | 相对变化 |
+|---|---:|---:|---:|
+| TTFT mean / p99 | 1876.714 / 1986.594 ms | **1559.362 / 1596.750 ms** | **-16.91% / -19.62%** |
+| TTFP mean / p99 | 1876.384 / 1986.270 ms | **1559.210 / 1596.599 ms** | **-16.90% / -19.62%** |
+| SPEAK RTF mean / median / p99 | 0.791225 / 0.788243 / 0.906307 | **0.596573 / 0.595077 / 0.663687** | **-24.60% / -24.51% / -26.77%** |
+
+该表的基线原始文件为
+`results/candidates/same_period_local4_baseline_npu5_n4_v3/result.json`，候选原始
+文件为 `results/candidates/fixed13_25_boundaryfix_hot_n4_v1/native_duplex_rtf.json`。
+`gate_vs_same_period_local4.json` 使用 `combined` 硬门禁重新计算上述变化并得到
+`passed=true`；另保留 `gate_vs_local4.json`，用于对更早的 local4 可靠基线做
+跨周期保守检查，两份门禁均通过。
+
+4/4 请求全部成功，每条均有 5 个音频包、3 个 SPEAK generation chunk、1 个
+SPEAK tail chunk、`response.done=1` 且错误数为 0。由于固定包会使相邻
+audio-bearing text window 重叠，data plane 增加同 turn 最长后缀/前缀去重；4 条
+transcript 均恢复为完整且不重复的
+`The two men hurried back and found the cylinder still lying in the same position`。
+零请求预热的真正首请求为 TTFT/TTFP 1738.882/1738.731 ms、SPEAK RTF
+0.612476，证明原先约 15 秒的首次 Code2Wav 懒编译已经迁移到启动阶段。
+
+4/25 首包消融在修正 deploy `extra` 浅覆盖问题后，首请求仍为
+TTFT/TTFP 1950.712/1950.428 ms、SPEAK RTF 0.702531，全面弱于 13/25，因此淘汰。
+晋级结果保存在
+`results/candidates/fixed13_25_runner_prewarm_transcriptfix_npu5_v1_cold/` 和
+`results/candidates/fixed13_25_boundaryfix_hot_n4_v1/`。
+以上仍是 910B4 开发数据，不得替代官方单卡 910C 最终成绩。
+
+固定 13/25 分块最初暴露了一个只在连续 Talker segment/多轮会话出现的连接器
+水位问题：resumable 请求复用 external request id，而 scheduler 在 sparse terminal
+packet 入队前已把 per-segment `num_computed_tokens` 清零，旧的抢占去重判断会把该
+terminal packet 以及下一段误判为重放，最终缺失 `tts_is_last_chunk` / `response.done`。
+修复后，仅 resumable segment boundary 可绕过下降水位检查，并在有序 save queue
+接收边界后重置水位；普通低水位包仍保持抢占去重。
+
+物理 NPU 5 的稳定性复测为 2 sessions × 3 turns：6/6 audio turns、6/6
+`response.done=completed`、0 cancelled、0 stale、0 truncate，所有 transcript 完整。
+TTFT mean/p50/p99 为 1657.591/1662.941/1726.047 ms，TTFP 为
+1657.458/1662.798/1725.925 ms，20 个 SPEAK generation chunk 的
+mean/median/p99 RTF 为 0.663337/0.691060/0.784743。原始结果位于
+`results/candidates/fixed13_25_multiturn_boundaryfix_s2_t3_v1/`；连接器日志无
+`Enqueue save_async` 下降水位告警，activation gate 全部通过。
+
+离线回归覆盖连接器水位、duplex serving/data plane、Talker local decode、
+Code2Wav 固定分块与缓存、NPU runner fast path、部署配置和候选门禁，共
+506 项同步与异步测试以标准 pytest 单轮全部通过、0 skipped。测试同时固定校验自包含 910C YAML 与物理 NPU 5 已测候选
+解析后的模型/执行热路径完全一致；允许的部署差异仅为设备号 `5 -> 0`，以及为
+官方 c8 矩阵把 session admission ceiling 从 1 提升到 8（Stage
+`max_num_seqs=4` 不变，多出的会话排队）。当前镜像原先没有异步插件；实际安装
+审计发现仓库 dev extra 的 `pytest==9.1.1` / `pytest-asyncio==1.4.0` 与镜像中
+`triton-ascend` 对 `pytest==8.3.2` 的硬依赖冲突，因此恢复并保留镜像 pytest，
+只安装兼容的 `pytest-asyncio==1.3.0` 完成上述标准复跑。完整 dev extra 如需验证
+应放在隔离 venv，不能污染比赛运行时环境。这些路径另有端到端 2 sessions × 3 turns
+的真实服务证据。
+
+local4 与 continuation 2× 的组合候选得到 TTFT/TTFP
+1898.158/1897.849 ms，SPEAK RTF mean/median/p99 为
+0.728925/0.763213/0.916626，请求级音频 RTF 为 0.961111。相对原 local2
+零等待最佳，mean RTF 改善 7.60%，但 p99 回退 1.72%；相对 local4 单独候选，
+mean RTF 改善 4.33%，p99 则回退 12.77%。4/4 请求均成功且每条保持 4 个包，
+但音频时长由 3.72 s 增至 4.40 s。因此该组合只作为需要完整 TTS-Seed 和 Demo
+主观连续性门禁的激进均值 RTF 候选，低尾延迟默认仍优先 local4 单独版本。
+原始结果：
+`results/candidates/euler_local4_zero_wait_silence_units2_npu5_n4_v1/result.json`。
+
+进一步把 local window 从 4 扩至 8 时，输出仍保持 3.72 s、4 个音频包和零错误。
+TTFT/TTFP 为 1903.592/1903.282 ms，SPEAK RTF mean/median/p99 为
+0.749311/0.762315/0.811865。相对 local4，mean RTF 仅继续改善 1.65%，p99
+基本持平，而 TTFT/TTFP 回退约 1.92%；相对原 local2，mean RTF 改善 5.02%，
+TTFT/TTFP 则回退约 0.68%。因此 8 步支持作为可回退 RTF 消融能力保留，均衡
+默认仍优先 4 步。原始结果：
+`results/candidates/euler_local8_zero_wait_npu5_n4_v1/result.json`。
+
+进一步把 runner-local 上限提高到 64，使 50 帧稳态 codec chunk 可以在一次
+scheduler 调用中持续解码，仍由真实 codec payload、终止事件和状态边界提前
+截断。4/4 请求保持 3.72 s、4 个音频包、零错误，TTFT/TTFP 为
+1906.830/1906.516 ms，SPEAK RTF mean/median/p99 为
+0.740966/0.748298/0.818287。相对 local4，mean RTF 再改善 2.75%，但首响回退
+约 2.09%，p99 RTF 略回退 0.67%；说明 scheduler 往返已接近耗尽，剩余主要是
+真实 Talker 计算。该候选保留为 RTF 专项消融，不替换 local4 均衡默认。原始
+结果：`results/candidates/euler_local64_zero_wait_npu5_n4_v1/result.json`。
+
+还尝试用 Top-K + 全量 logsumexp 在数学上等价重建 Talker 的 Top-P→Top-K
+候选分布，避免每个 codec token 对 6562 维 logits 做完整排序。CPU 分布一致性
+测试通过，但在 NPU 图外执行时产生严重的小算子下发/同步开销：local4 warmup
+请求 180 秒内未产生 `response.created`，被测试超时中止。因此该实现已回滚，
+不会进入默认配置；后续若继续优化采样，必须把完整 sampler 纳入设备图，而不是
+在 Python 图外组合更多 NPU 算子。
+
+昇腾还提供 fused TopK/TopP/multinomial 一体算子，独立微基准约
+0.278 ms/token，但在 Stage 1 多进程 runner 中传入 NPU generator 后同样导致
+warmup 请求 180 秒超时。该一体化路径也不进入配置。去掉 fused multinomial，
+仅使用 `npu_top_k_top_p` 过滤并保留原 `torch.multinomial` 后，独立微基准为
+0.182 ms/token（原路径约 0.448 ms/token），但真实 local4 warmup 同样在 180 秒
+内没有产生 `response.created`。因此三种图外 sampler 变体均已淘汰并回滚；后续
+只有将完整 sampler 纳入已捕获设备图，才值得重新验证这一方向。
+
+还尝试把 Stage 1 Talker 的模型加载、FULL decode 图捕获和每次 replay 放到
+priority=-1 的昇腾高优先级 stream，希望在单卡 SPEAK 阶段优先于 Stage 0
+监听和 Stage 2 音频计算。4/4 请求功能完整，TTFT/TTFP 为
+1844.898/1844.520 ms，相对 local4 改善约 1.23%；但 SPEAK RTF
+mean/median/p99 为 0.787351/0.796364/0.878903，相对 local4 分别回退约
+3.34%/3.08%/8.13%。跨进程同卡竞争没有被该进程内 stream 优先级有效消除，
+额外 stream 还放大了尾延迟，因此实现已回滚。原始结果：
+`results/candidates/euler_local4_priority_npu5_n4_v1/result.json`。
+
+local4 与 fused Token2Wav encoder attention 的正交组合把 TTFT/TTFP 进一步降至
+1821.164/1820.842 ms，相对原 local2 改善 3.68%，相对 local4 改善 2.50%；
+但 SPEAK RTF mean/median/p99 为 0.799634/0.799641/1.008936，相对 local4 的
+mean/p99 分别回退 4.95%/24.13%。音频仍为 3.72 s、4 包且零错误，因此不是
+输出缩短造成的假回退。该组合只保留为 TTFT/TTFP 专项候选，不能替换三指标
+均衡的 local4。原始结果：
+`results/candidates/euler_local4_zero_wait_fused_encoder_attn_npu5_n4_v1/result.json`。
+
+### 新增高杠杆实验：低精度与控制面整合
+
+在 local4 默认候选上仅将 Token2Wav Flow 权重和计算改为 BF16、HiFT 保持
+FP32，启动日志确认 `flow_dtype=torch.bfloat16`。物理 NPU 5、1 次预热 +
+4 次正式请求均成功，音频仍为 3.72 s、4 包，但 TTFT/TTFP 为
+1896.009/1895.627 ms，SPEAK RTF mean/median/p99 为
+0.773944/0.772417/0.890897。相对 local4，TTFT/TTFP 均回退约 1.51%，
+RTF mean 回退 1.58%、p99 回退 9.61%，因此 Flow BF16 淘汰。原始结果：
+`results/candidates/euler_local4_flow_bf16_npu5_n4_v1/result.json`。
+
+随后尝试复用 Stage 1 runner-local decode 的 Ascend attention metadata：保持
+block table、slot mapping 和 tensor 地址不变，仅刷新 Python `seq_lens_list`，
+未知 schema 自动回退标准 builder。服务正常启动，Stage 0/1 均进入 ACLGraph
+replay，但 duplex 请求无法在客户端超时前形成首包。说明 FULL graph 的 metadata
+还包含未显式暴露的逐步状态；该实现已完整回滚，未进入默认代码。
+
+最后组合 local64、Token2Wav fused encoder attention 与 native continuation 2×，
+希望叠加完整 codec chunk 的 scheduler 往返消除、Stage 2 attention 融合和两秒
+SPEAK continuation 的控制面摊薄。启动日志确认 local64 FULL graph 和 10 层融合
+attention 均生效，但组合路径同样在 Stage 0/1 ACLGraph replay 后首包超时，未产生
+可计分结果。三个单项不能在当前控制面简单相乘；该 YAML 仅作为失败消融记录，
+不进入 910C 候选。
+
+此前 local2 候选先通过 Seed-TTS 三条本地 Whisper 小门禁（mean/median WER=0），随后
 扩大到 10 条：10/10 请求成功，mean WER=0.0253、median WER=0，请求失败、
 空 PCM、ASR/WER 失败均为 0，满足当前 `mean WER <= 0.05` 门槛。10 条
 `/chat/completions` 辅助性能为 TTFT mean 366.74 ms、TTFP mean 521.53 ms；
@@ -268,6 +455,54 @@ playback history、事件顺序和会话关闭检查通过。该测试得到 TTF
 1844.35/1844.12 ms，22 个 SPEAK chunk 的 mean/median/p99 RTF 为
 0.744630/0.770439/0.894368。结果位于
 `results/candidates/euler_local2_zero_wait_multiturn_s2_t3_v1/result.json`。
+
+### Native continuation 合并与 Ascend encoder 融合注意力
+
+为降低每秒 silence continuation 重复经过 serving、orchestrator、connector 和
+Stage 0 prefill 的固定开销，新增了默认关闭的部署参数：
+
+```yaml
+duplex_session:
+  native_silence_continuation_units_per_append: 2
+```
+
+默认值仍为 1，不改变官方逐秒决策节奏。物理 NPU 5、并发 1、1 次预热 +
+4 次正式请求下，2× 合并单独得到 TTFT/TTFP 1949.339/1949.016 ms，SPEAK
+RTF mean 0.703871；相对当前最佳首响回退约 3.1%，但 RTF 改善约 10.8%。
+4× 合并的 TTFT/TTFP/RTF 为 1999.398/1999.081 ms/0.801414，全面回退；只在
+首个音频包后启用 2× 合并则令音频缩短到 3.76 s，RTF 回退到 0.873296。
+因此不再扩大倍率，2× 仅作为需要完整音质门禁的 RTF 候选。
+
+随后启用 `token2wav_npu_fused_encoder_attention`，将 10 层 Token2Wav
+Conformer 相对位置注意力的 eager QK/softmax/AV 替换为
+`torch_npu.npu_fusion_attention`，并将原始相对位置项作为 PSE 输入。该候选
+不改变模型权重、采样参数或 CFM 积分算法，4/4 请求输出完整且无错误：
+
+| 候选 | TTFT mean | TTFP mean | SPEAK RTF mean | 相对当前最佳 |
+|---|---:|---:|---:|---|
+| 仅 fused encoder attention | **1831.229 ms** | **1830.898 ms** | 0.791304 | TTFT/TTFP -3.15%，RTF +0.30% |
+| fused attention + continuation 2× | 1898.110 ms | 1897.788 ms | **0.730806** | TTFT/TTFP +0.39%，RTF **-7.37%** |
+
+组合候选的请求级音频 RTF 为 0.962726，首次低于实时 1.0；但输出音频从当前
+最佳的 3.72 s 增至 4.40 s，SPEAK RTF p99 为 0.926848，高于当前最佳的
+0.901119。它必须通过完整 TTS-Seed、官方 Demo 主观连续性和 910C 复测后才能
+晋级；纯融合注意力候选则是当前低风险 TTFT/TTFP 最优配置。原始结果：
+
+- `results/candidates/euler_local2_zero_wait_fused_encoder_attn_npu5_n4_v1/result.json`
+- `results/candidates/euler_local2_zero_wait_fused_encoder_attn_silence_units2_npu5_n4_v1/result.json`
+
+另将融合注意力候选的稳态 codec chunk 从 50 帧增至 75 帧，希望进一步摊薄
+Stage 2 固定开销。相同物理 NPU 5、1 次预热 + 4 次正式请求下，TTFT/TTFP
+回退到 1927.130/1926.772 ms，SPEAK RTF mean/median 为
+0.791668/0.797093，均未优于 50 帧候选；仅 p99 从 0.901119 降至
+0.871603，而请求级音频 RTF 回退到 1.067913。音频总时长仍为 3.72 s，排除
+输出长度变化造成的假收益。该配置作为负向消融证据保留，不进入正式候选；
+原始结果位于
+`results/candidates/euler_local2_zero_wait_fused_encoder_attn_chunk75_npu5_n4_v1/result.json`。
+
+另测试了将 Thinker 单段 token 上限从 20 降至 12。两次端到端结果的聚合
+Stage 0 token 数仍为 20，TTFT/TTFP 未改善，说明 continuation 累计/控制面覆盖
+使该旋钮无法形成有效首段提前交接；相关运行时代码已移除，不进入提交。
 
 ### 不同参考音频的 TTFP 冷启动归因与淘汰实验
 
@@ -402,13 +637,187 @@ TTFT 的小样本回退与 Stage 2 算法无直接依赖，需要在更大样本
 保存 WAV 的 clipping rate 为 3.13%–7.09%，最大相邻跳变达到满幅 2.0。
 因此该候选即使性能增益明显也已淘汰，不能进入 Demo 或最终配置。
 
+### Talker codec sampler ACLGraph
+
+Stage 1 profiler 显示 codec sampler 存在大量小算子下发、`bincount`、全词表排序
+和 Host wait。O33 尝试将确定性路径
+`head_code → repetition penalty → Top-P → Top-K → softmax` 捕获为独立
+ACLGraph；`torch.multinomial` 仍使用原 request-owned generator 在图外执行，
+因此 RNG 生命周期和抽样顺序不变。Top-P 在数学上改写为 Top-K-first：用全词表
+`logsumexp` 与候选的 exclusive cumulative probability 重建相同 nucleus mask，
+避免每 token 对 6562 个 codec logits 完整排序。
+
+物理 NPU 5、BF16、hidden 768、vocab 6562 的 500 次微基准结果：
+
+| 路径 | Mean wall time / codec token |
+|---|---:|
+| Top-K-first eager sampler | 1.1150 ms |
+| all-history ACLGraph sampler | 0.2698 ms |
+| 加速比 | **4.13×** |
+
+history 长度 0、7、16 与 EOS masked/eligible 共 6 种分支的概率最大绝对误差、
+概率总误差均为 0，finite mask 和 candidate ids 完全相同。实验后期通过固定
+16 槽 history 与设备端有效权重模板，使首个 codec token 就进入 graph，覆盖
+TTFP 关键路径。原始结果：
+`results/profiles/talker_sampler_graph_all_history_npu5.json`。
+
+完整三阶段复测严格绑定物理 NPU 5。卡释放后，Stage 1 独立 sampler graph 与
+模型 `FULL_DECODE_ONLY/NPUGraph_ex` 均能完成捕获，服务也能正常启动；但首次
+native duplex 请求在 Stage 0/1 ACLGraph replay 后停止推进，3 分钟内没有
+`response.created`。加入 sampler 输入 stream 同步后，微基准仍为 3.16×，但完整
+链路在同一位置再次停滞。因此独立 graph 生产接入和对应 YAML 已完整回滚。
+
+O34 随后只保留不依赖独立 graph 的 Top-K-first 数学改写，在正常 Stage 1 路径
+执行。它先取最终可采样的 Top-K 候选，再利用全词表 `logsumexp` 和候选 exclusive
+cumulative probability 重建与原 Top-P warper 相同的保留 mask，最后只对至多
+25 个候选执行 softmax/multinomial。随机与集中分布 CPU 测试均与原 dense 路径
+概率一致，纯 NPU sampler 微基准从 1.428 ms/token 降至 0.798 ms/token（1.79×）。
+但 local64 完整服务首次 native duplex 请求仍在 Stage 0/1 ACLGraph replay 后停止
+推进，说明该后处理算子序列本身与当前 NPUGraph_ex 流存在兼容性问题。生产代码、
+测试开关和 YAML 已完整回滚，仅保留原始性能 JSON 作为后续 Ascend 后端修复证据。
+
+O35 继续尝试把最重的 768→6562 `head_code` 投影并入 Stage 1 已有
+`FULL_DECODE_ONLY/NPUGraph_ex` 模型图，同时只对 runner 的 `logits_indices`
+采样行做投影，避免 prefill 全序列投影。第一版将 codec logits 作为模型的第二个
+graph output 返回；Stage 1 能正常编译和捕获，但物理 NPU 5 首次请求 replay 后，
+该额外 output 的地址失效，随后在 repetition penalty 同步时报 MTE DDR 越界，
+因此该输出协议已淘汰。当前实验版改为模型唯一输出保持原 hidden states，图内把
+codec logits `copy_` 到固定模型驻留 buffer，图外 sampler 读取该 buffer；开关默认
+关闭，仅存在于
+`config/ablations/minicpmo_4_5_duplex_euler_local4_graph_head_npu5.yaml`。
+CPU 等价、采样行路由、静态检查均通过；NPU smoke 和性能结论待复测，未进入默认
+竞赛配置。
+
+O36 针对当前剩余的最大结构性瓶颈：Stage 2 仍为完全 eager。默认稳态窗口由
+3 帧 codec 左上下文和 50 个新 frame 组成；attention cache 达到截断上限后，
+`Conformer forward_chunk → 单步 conditional CFM DiT → HiFT` 的输入和 7 组流式
+cache shape 均固定。`scripts/profile_token2wav.py` 新增
+`--compare-steady-npugraph --npugraph-only`，在不启动三阶段服务的情况下：
+
+1. 自动运行至连续两次 cache signature 相同；
+2. 从同一份 state 分叉 eager 与 NPUGraph 链路；
+3. 每次 replay 前把上一轮 graph output cache 回灌到固定输入；
+4. 同步统计包含 cache copy 与 replay 的 wall time；
+5. 对首轮和最终轮音频及全部 flow/HiFT cache 报告最大绝对误差。
+
+物理 NPU 5 的筛选命令为：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=5 python \
+  competition/minicpmo_b/scripts/profile_token2wav.py \
+  --device npu:0 --cfg-mode conditional --solver euler --steps 1 \
+  --initial-frames 4 --steady-frames 50 --warmups 4 --iterations 20 \
+  --compare-steady-npugraph --npugraph-only \
+  --output competition/minicpmo_b/results/profiles/token2wav_steady_npugraph_npu5.json
+```
+
+生产侧已加入默认关闭的精确 shape 分派。启用
+`token2wav_steady_npugraph: true` 时，启动预热会自动推进到连续两次 cache shape
+稳定，再捕获单请求、非 terminal 的固定 packet 整链。每次 replay 前回灌 codec、
+speech token、speaker embedding、prompt mel 和全部请求 cache，replay 后把音频与新 cache 克隆为请求私有
+存储；首块、尾块、flush、batch>1、prompt 长度或 cache shape 不匹配均自动回退
+eager。完整条件回灌很关键：graph key 是 shape bucket，同长度但内容不同的参考音频
+不能继续沿用 capture 时的 speech token/mel。进一步审计发现默认 `HT_ref_audio.wav` 为 6.02 s，而 native duplex 脚本
+传入的 `system_ref_audio.wav` 为 16.84 s，二者稳定 attention-cache shape 不同；
+因此实现已改为按 `(token layout, prompt mel length, state signature)` 保存多个 graph
+bucket，并通过 `code2wav_npugraph_prompt_wavs` 在启动时额外捕获 Demo/评测参考音频
+shape。当前 fixed-13/25 最佳候选对应的单变量实验 YAML 为
+`config/ablations/minicpmo_4_5_duplex_euler_local4_graph_sampler_cpu_slot_fixed13_25_prewarm_ref_steady_npugraph_npu5.yaml`。
+完整 Code2Wav CPU 测试 47/47 通过，但在音频/cache 数值等价、端到端收益和多轮
+稳定性通过物理 NPU 5 门禁前，不进入默认竞赛配置。
+
+O37 针对同一参考音频在顺序请求间的重复固定开销。原实现会在最后一个 owner
+结束时立即删除临时 WAV，并调用 `evict_prompt` 清除 S3Tokenizer 输出、speaker
+embedding 和 prompt mel/token features；官方/native duplex 客户端每轮都提交同一
+`system_ref_audio.wav`，因此每次请求都会重复 CPU 特征提取和 NPU prompt setup。
+新增 `code2wav_runtime_prompt_cache_size` 后，内容 SHA256 相同的未占用参考音频按
+LRU 有界保留；再次出现时直接复用已有文件及 prompt features。进一步启用
+`code2wav_cache_runtime_initial_state` 后，还会复用该 prompt 的只读 Conformer/CFM
+初始 cache，首个 live chunk 返回的新 state 仍按请求隔离；超过容量时统一释放文件、
+features 和初始 state。`code2wav_runtime_prompt_preload_wavs` 还可在服务启动时按
+native duplex 的 16 kHz mono、整 100 ms frame 规则规范化并预载官方 Demo 音色，
+使首个正式交互也能直接命中，而不依赖客户端 warmup。默认容量仍为 0，保持原资源
+生命周期；独立实验配置为
+`config/ablations/minicpmo_4_5_duplex_euler_local4_runtime_prompt_cache_npu5.yaml`。
+该优化不改变权重、codec、CFM 或 HiFT 数值，预期只影响重复音色场景的 TTFT/TTFP；
+实际收益必须用一次预热后 4 次正式顺序请求确认。
+
+O38 覆盖同一重复开销在 Stage 0 的另一半：每个新会话原先都会重新运行
+`processor.process_audio → get_audio_embedding/get_audio_hidden_states` 处理 16.8 s
+参考音频。`stage0_ref_audio_embedding_cache_size` 使用归一化 FP32 waveform SHA256
+作为 key，并按 LRU 有界保存只读 embedding tensor。为避免破坏 session-local APM
+cache，只有模型暴露不依赖 `state` 的直接 reference encoder 路径时才允许命中；
+streaming fallback 始终保持原执行。该开关已加入 O37 独立配置和 O36+O37 组合配置。
+
+O36/O37 的物理 NPU 5 晋级顺序固定为：先独立微基准，再两个单变量端到端 A/B，
+最后才测试组合配置。所有服务均绑定 8095，且 deploy config 解析结果必须为
+`devices=['5','5','5']`。
+
+1. O36 使用 `system_ref_audio.wav` 执行 production-dispatch 微基准；音频和每组
+   cache 最大绝对误差必须在 FP32 NPU 数值抖动范围内，graph wall time 至少改善
+   1.5×，否则不启动完整服务。
+2. O37 使用 1 次预热 + 4 次正式顺序请求；正式请求应只出现一次 prompt feature/
+   initial-state 构建。TTFT、TTFP mean 至少改善 10%，SPEAK RTF 不得回退超过 2%。
+3. O36 完整服务要求 SPEAK RTF mean 至少改善 15%，p99 不回退，TTFT/TTFP 不回退
+   超过 2%，且日志中必须出现 `Captured steady ... NPUGraph bucket` 和
+   `Replayed steady ... NPUGraph`。
+4. 两项独立通过后测试
+   `config/ablations/minicpmo_4_5_duplex_euler_local4_npugraph_prompt_cache_npu5.yaml`；
+   组合结果必须重新执行 Seed-TTS n10 和 native duplex 2 会话 × 3 轮门禁。
+
+### O40/O41：Stage 1 profiler 驱动的等价热路径消除
+
+已有 Stage 1 `FULL_DECODE_ONLY` profiler 的 178 个 decode token 中，设备时间主要为：
+
+- `MatMulV2` 36.19%，`FusedInferAttentionScore` 22.58%；
+- `_compute_slot_mapping_kernel` 8.03%；
+- codec sampler 的 `Bincount` 6.03%、`ScatterElements` 8.29%，另有 full-vocab
+  `Sort/Cumsum/MaskedFill` 约 1.42%。
+
+用 `scripts/summarize_ascend_ops.py` 按完整 sampler 控制组重新汇总后，slot mapping
+与 sampler control 合计占设备时间 24.46%，对应 device-only Amdahl 上限 1.324×；
+端到端收益仍受 Host wait、阶段重叠和 graph replay 约束。O40 从 CPU block table 按
+`block_id * block_size + offset` 直接计算当前请求的 slot，并只复制 `num_reqs` 个值
+到 NPU；现在同时覆盖 scheduler-visible 的纯单 token decode 和 runner-local 子步，
+而 prefill、speculative、CP 或不支持的 block layout 会保留/自动回退原 GPU kernel。
+独立配置为
+`config/ablations/minicpmo_4_5_duplex_euler_local4_cpu_slot_npu5.yaml`。
+
+O41 不再像已淘汰的 O33 那样创建第二张 sampler graph，也不再像 O34 那样把新的
+算子序列留在 `FULL_DECODE_ONLY` graph 外。runner 在每次初始/local forward 前刷新
+固定 `[batch,16]` codec history 与 EOS mask；现有模型 FULL graph 内完成：
+
+1. 仅投影 `logits_indices` 对应的采样行；
+2. 用 16×16 的窗口内去重计数、gather 和单次 scatter 精确替代 AI-CPU
+   `Bincount`，不再构造 `[batch,16,6562]` 比较张量；
+3. 先取 Top-K，再用全词表 `logsumexp` 和候选 exclusive cumulative probability
+   精确重建原始 Top-P→Top-K mask；
+4. 把 compact FP32 candidate logits/IDs 写入模型驻留 buffer，图外仅保留 compact
+   `multinomial`；runner 用循环历史缓存让稳态 local step 只更新一个 codec 标量，
+   请求 compaction、prefill 或 step 跳变才重建整行。
+
+O42 继续消除 codec 采样之后的第二套通用 sampler：Talker 的 engine token 只有
+`continue/stop` 两列，模型和 min-token logit bias 处理后每行至多一个有效候选，
+因此直接 argmax 与原采样分布等价。若请求启用 logprobs、allowed token IDs、bad
+words 或 penalty，则自动回退 vLLM 通用 Sampler，避免扩大接口语义风险。
+
+随机与集中 logits 的 CPU 测试均确认最终 finite mask 和归一化概率与原 dense 路径
+一致。组合配置为
+`config/ablations/minicpmo_4_5_duplex_euler_local4_graph_sampler_cpu_slot_npu5.yaml`。
+晋级要求：日志同时证明 FULL graph、CPU slot fast path 和 graph sampler 启用；相对
+local4 同周期基线，SPEAK RTF mean 至少改善 12%、p99 不回退，TTFT/TTFP 回退不
+超过 2%；随后必须通过 Seed-TTS n10、native duplex 2×3 和 Demo 主观连续性。当前
+未获得 NPU 5 实验授权，因此没有填写任何未经实测的性能数字，也未修改默认配置。
+
 ## 4. 精度结果
 
 | Benchmark | 官方门槛 | 基线 | 优化版 | 差值 | 结论 |
 |---|---:|---:|---:|---:|---|
-| Daily-Omni accuracy | ≥0.78 | 待填写 | 待填写 | 待填写 | 待填写 |
-| Video-MME accuracy | ≥0.68 | 待填写 | 待填写 | 待填写 | 待填写 |
-| Seed-TTS mean WER | ≤0.05 | 待填写 | 待填写 | 待填写 | 待填写 |
+| Daily-Omni accuracy | ≥0.78 且相对基线降幅 ≤2pp | 待填写 | 待填写 | 待填写 | 待填写 |
+| Video-MME accuracy | ≥0.68 且相对基线降幅 ≤2pp | 待填写 | 待填写 | 待填写 | 待填写 |
+| Seed-TTS mean WER | ≤0.05 且相对基线增幅 ≤2pp | 待填写 | 待填写 | 待填写 | 待填写 |
+| Seed-TTS speaker SIM | 相对基线降幅 ≤2pp，完整 1000/1000 | 待填写 | 待填写 | 待填写 | 待填写 |
+| Seed-TTS UTMOS | 相对基线降幅 ≤2pp，完整 1000/1000 | 待填写 | 待填写 | 待填写 | 待填写 |
 
 ### 开发机端到端精度冒烟
 
@@ -423,7 +832,7 @@ TTFT 的小样本回退与 Stage 2 算法无直接依赖，需要在更大样本
 
 ## 5. 稳定性与 Demo
 
-- 连续请求数量/时长：待填写
+- 连续请求数量/时长：native duplex 2 sessions × 3 turns 已通过；官方 Demo 长稳仍待录制
 - 音频中断、重复或空首块：4 请求冒烟中 continuity OK 100%；主观爆音检查待完成
 - 峰值 NPU 显存、CPU、主存：待填写
 - Demo 视频：待填写

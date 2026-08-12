@@ -158,6 +158,17 @@ def _codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     return chunk_frames, left_context_frames, initial_chunk_frames
 
 
+def _fixed_nonfinal_codec_chunks(transfer_manager: Any) -> bool:
+    connector = getattr(transfer_manager, "connector", None)
+    raw_config = getattr(connector, "config", {}) or {}
+    config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
+    return bool(
+        config.get("talker_fixed_nonfinal_codec_chunks", False)
+        if isinstance(config, dict)
+        else False
+    )
+
+
 def _codec_scalars(value: Any) -> list[int]:
     """Normalize one request-routed codec delta to CPU scalar token IDs."""
     if value is None:
@@ -332,6 +343,7 @@ def tts2code2wav_async_chunk(
             turn_end,
         )
     chunk_frames, left_context_frames, initial_chunk_frames = _codec_config(transfer_manager)
+    fixed_nonfinal_chunks = _fixed_nonfinal_codec_chunks(transfer_manager)
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     first_chunk = int(state["codec_end"]) == 0
@@ -339,10 +351,25 @@ def tts2code2wav_async_chunk(
     if not flush_pending and len(pending) < emit_frames:
         return None
 
-    hold_short_unit = (
-        native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
+    hold_partial_unit = (
+        native_duplex
+        and flush_pending
+        and not last_chunk
+        and 0 < len(pending) < (
+            emit_frames if fixed_nonfinal_chunks else _MINICPMO45_MIN_STREAM_BODY_FRAMES
+        )
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else emit_frames)
+    if hold_partial_unit:
+        new_token_count = 0
+    elif native_duplex and fixed_nonfinal_chunks and not last_chunk:
+        # Keep every counted SPEAK-generation invocation on one of the
+        # startup-prewarmed shapes. Talker unit boundaries may leave a short
+        # remainder; retain it across units instead of forcing a new lazy TBE
+        # compile shape. The final Thinker turn-end packet still flushes the
+        # exact remainder and is classified as SPEAK tail.
+        new_token_count = emit_frames
+    else:
+        new_token_count = len(pending) if flush_pending else emit_frames
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
@@ -427,6 +454,25 @@ def tts2code2wav_async_chunk(
         record["cache_epoch"] = int(record["cache_epoch"]) + 1
         record["chunk_seq"] = 0
         _drop_codec_state(transfer_manager, request_id)
+    if native_duplex and os.getenv("MINICPMO45_DUPLEX_DEBUG") == "1":
+        logger.info(
+            "MiniCPM-o duplex Code2Wav payload: request_id=%s internal_id=%s "
+            "chunk_seq=%d pending=%d new=%d context=%d wire=%d "
+            "text_bytes=%d tts_last=%s last=%s turn_end=%s",
+            request_id,
+            internal_id,
+            chunk_seq,
+            len(pending),
+            new_token_count,
+            len(context),
+            code_flat_numel,
+            int(segment_text_utf8.numel())
+            if isinstance(segment_text_utf8, torch.Tensor)
+            else 0,
+            flush_pending,
+            last_chunk,
+            turn_end,
+        )
     return payload
 
 
@@ -985,8 +1031,13 @@ def llm2tts(
             if not handoff_ids:
                 continue
         set_tts_handoff(model_intermediate_buffer, handoff_ids, handoff_hidden)
-        if native_turn_end_handoff:
-            model_intermediate_buffer.setdefault("meta", {})["turn_end"] = True
+        if is_native_duplex_handoff:
+            # Stage 1 used to rescan the transported TTS IDs on every codec
+            # token and synchronize a device scalar to discover this invariant.
+            # Publish it explicitly once at the CPU-side handoff instead.
+            model_intermediate_buffer.setdefault("meta", {})["turn_end"] = bool(
+                native_turn_end_handoff
+            )
 
         if handoff_ids is not None and handoff_hidden is not None:
             condition_suffix_length = 1 if is_native_duplex_handoff else 2

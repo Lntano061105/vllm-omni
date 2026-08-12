@@ -33,6 +33,8 @@ def test_duplex_session_runtime_defaults_are_typed_and_immutable(tmp_path) -> No
     assert deploy.duplex_session.max_sessions == 1
     assert deploy.duplex_session.completed_append_cache_size == 256
     assert deploy.duplex_session.native_silence_continuation_delay_ms is None
+    assert deploy.duplex_session.native_silence_continuation_units_per_append == 1
+    assert deploy.duplex_session.native_silence_batch_after_first_audio_only is False
     with pytest.raises(FrozenInstanceError):
         deploy.duplex_session.idle_ttl_s = 1.0  # type: ignore[misc]
 
@@ -70,6 +72,28 @@ def test_duplex_session_runtime_rejects_negative_native_silence_delay(tmp_path) 
         match=(
             r"duplex_session\.native_silence_continuation_delay_ms "
             r"must be >= 0 or null"
+        ),
+    ):
+        load_deploy_config(deploy_path)
+
+
+@pytest.mark.parametrize("value", [0, 9])
+def test_duplex_session_runtime_rejects_invalid_native_silence_units_per_append(
+    tmp_path, value: int
+) -> None:
+    deploy_path = tmp_path / "duplex.yaml"
+    deploy_path.write_text(
+        "duplex_session:\n"
+        f"  native_silence_continuation_units_per_append: {value}\n"
+        "stages: []\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"duplex_session\.native_silence_continuation_units_per_append "
+            r"must be between 1 and 8"
         ),
     ):
         load_deploy_config(deploy_path)

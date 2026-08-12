@@ -439,6 +439,17 @@ class DuplexSessionRuntimeConfig:
     # zero lets latency-focused deployments immediately schedule the next
     # equivalent silence unit without changing its audio payload duration.
     native_silence_continuation_delay_ms: int | None = None
+    # Number of one-second model-native silence units submitted in one
+    # continuation append.  Values above one are an opt-in latency ablation:
+    # Stage 0 can prefill several silent units in one scheduler submission,
+    # reducing repeated serving/orchestrator/connector round trips.  Keep the
+    # default at one to preserve the official per-second decision cadence.
+    native_silence_continuation_units_per_append: int = 1
+    # Preserve one-unit LISTEN decisions until the first audio packet has
+    # been produced, then enable the configured batching only for the
+    # SPEAK/SPEAK-tail continuation path.  This isolates steady-state RTF
+    # optimization from TTFT/TTFP behavior.
+    native_silence_batch_after_first_audio_only: bool = False
 
     def __post_init__(self) -> None:
         positive = {
@@ -459,6 +470,11 @@ class DuplexSessionRuntimeConfig:
         ):
             raise ValueError(
                 "duplex_session.native_silence_continuation_delay_ms must be >= 0 or null"
+            )
+        if not 1 <= self.native_silence_continuation_units_per_append <= 8:
+            raise ValueError(
+                "duplex_session.native_silence_continuation_units_per_append "
+                "must be between 1 and 8"
             )
         for name, value in positive.items():
             if value <= 0:

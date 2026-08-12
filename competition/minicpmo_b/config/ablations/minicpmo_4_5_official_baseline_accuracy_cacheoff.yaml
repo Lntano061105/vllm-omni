@@ -1,0 +1,9 @@
+# Accuracy-only stability overlay for the upstream single-card baseline.
+# Disabling the mirrored API/Engine multimodal processor LRU prevents long-run
+# eviction-order divergence. It does not skip VPM/APM/LLM, alter weights,
+# sampling, media packing, or generated outputs.
+base_config: ../../../../vllm_omni/deploy/minicpmo_4_5.yaml
+
+stages:
+  - stage_id: 0
+    mm_processor_cache_gb: 0

@@ -21,6 +21,31 @@ git rev-parse HEAD > "${RESULT_DIR}/git_commit.txt"
 git status --short > "${RESULT_DIR}/git_status.txt"
 npu-smi info > "${RESULT_DIR}/npu_smi.txt" 2>&1 || true
 cp "${DEPLOY_CONFIG}" "${RESULT_DIR}/deploy_config.yaml"
+PERF_SEED_TTS_ROOT="${SEED_TTS_PATH:-/workspace/seed-tts}"
+if [[ ! -f "${PERF_SEED_TTS_ROOT}/en/meta.lst" ]]; then
+  PERF_SEED_TTS_ROOT="${SEED_TTS_EXTRACT_DIR:-/tmp/minicpmo_b_seedtts}"
+fi
+python competition/minicpmo_b/scripts/run_protocol.py write \
+  --output "${RESULT_DIR}/run_protocol.json" \
+  --kind chat-completions-performance-matrix \
+  --field served_model_name="${SERVED_MODEL_NAME}" \
+  --field dataset=seed-tts \
+  --field seed_tts_path="${PERF_SEED_TTS_ROOT}" \
+  --field seed_tts_locale=en \
+  --field temperature=0 \
+  --field request_rate=inf \
+  --field no_oversample=true \
+  --field disable_shuffle=false \
+  --field benchmark_seed="${BENCHMARK_SEED:-0}" \
+  --field num_warmups="${NUM_WARMUPS:-2}" \
+  --field c1_prompts="${C1_PROMPTS:-32}" \
+  --field c4_prompts="${C4_PROMPTS:-64}" \
+  --field c8_prompts="${C8_PROMPTS:-128}" \
+  --field extra_body='{"modalities":["text","audio"],"chat_template_kwargs":{"enable_thinking":false,"use_tts_template":true}}' \
+  --file seed_tts_meta="${PERF_SEED_TTS_ROOT}/en/meta.lst" \
+  --variant-field label="${CASE_NAME}" \
+  --variant-file deploy_config="${DEPLOY_CONFIG}" \
+  > "${RESULT_DIR}/run_protocol.log"
 
 DEPLOY_CONFIG="${DEPLOY_CONFIG}" \
 MODEL_PATH="${MODEL_PATH}" \
@@ -57,6 +82,7 @@ run_case() {
   SERVED_MODEL_NAME="${SERVED_MODEL_NAME}" \
   NUM_PROMPTS="${prompts}" \
   MAX_CONCURRENCY="${concurrency}" \
+  BENCHMARK_SEED="${BENCHMARK_SEED:-0}" \
   RESULT_DIR="${RESULT_DIR}" \
   RESULT_FILENAME="${result_filename}" \
   competition/minicpmo_b/scripts/benchmark_seed_tts.sh

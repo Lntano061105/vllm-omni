@@ -133,6 +133,7 @@ def test_native_duplex_speak_segment_reaches_split_talker() -> None:
     assert info["meta"]["next_stage_prompt_len"] == 3
     assert info["meta"]["turn_start"] is True
     assert info["meta"]["segment_end"] is True
+    assert info["meta"]["turn_end"] is False
     assert info["duplex"]["epoch"] == 3
     assert info["duplex"]["turn_id"] == 7
 

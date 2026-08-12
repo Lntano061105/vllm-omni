@@ -2,9 +2,10 @@
 #
 # This is the portable device-0 form of the best profile validated on physical
 # NPU 5 of the 910B4 development machine: native duplex + Stage-1 full decode
-# graph + runner-local two-step Talker decode + conditional Euler Token2Wav +
-# zero wall-clock pacing for native silence continuations.  It must still be
-# re-gated on the official 910C before final score submission.
+# graph + runner-local four-step Talker decode + exact graph sampler + fixed
+# 13/25-frame Code2Wav packets + startup reference/cache prewarm + conditional
+# Euler Token2Wav + zero wall-clock pacing for native silence continuations.
+# It must still be re-gated on the official 910C before final score submission.
 pipeline: minicpmo_4_5
 async_chunk: true
 session_mode: duplex
@@ -14,14 +15,16 @@ trust_remote_code: true
 enable_prefix_caching: false
 
 duplex_session:
-  idle_ttl_s: 300
-  disconnect_grace_s: 30
-  reaper_interval_s: 5
-  resume_replay_ttl_s: 60
+  idle_ttl_s: 300.0
+  disconnect_grace_s: 30.0
+  reaper_interval_s: 5.0
+  resume_replay_ttl_s: 60.0
   resume_replay_max_bytes_per_session: 8388608
   max_pending_input_bytes_per_session: 16777216
   max_pending_turns_per_session: 4
-  max_sessions: 4
+  # The official matrix includes c8. Stage max_num_seqs remains four, so the
+  # extra admitted sessions queue without changing the measured c1 hot path.
+  max_sessions: 8
   completed_append_cache_size: 256
   # Preserve the model's one-second silent PCM continuation while removing
   # the artificial one-second wall-clock sleep before submitting it.
@@ -36,22 +39,40 @@ connectors:
       connector_get_max_wait: 300
       code2wav_cache_initial_state: true
       code2wav_cross_prompt_batching: true
+      code2wav_runtime_prompt_cache_size: 4
+      code2wav_cache_runtime_initial_state: true
+      code2wav_runtime_prompt_preload_wavs:
+        - assets/system_ref_audio.wav
+      code2wav_runtime_prompt_preload_sample_rate: 16000
+      code2wav_runtime_prompt_preload_frame_samples: 1600
       code2wav_prewarm: true
+      code2wav_runner_prewarm: true
       token2wav_cfg_mode: conditional
       token2wav_solver: euler
       token2wav_n_timesteps: 1
       token2wav_remove_hift_weight_norm: true
       talker_emit_codec_chunks: true
-      initial_codec_chunk_frames: 4
-      codec_chunk_frames: 50
+      initial_codec_chunk_frames: 13
+      codec_chunk_frames: 25
       codec_left_context_frames: 3
       talker_local_decode_stage_id: 1
-      talker_local_decode_steps: 2
+      talker_local_decode_steps: 4
+      talker_local_cpu_slot_mapping: true
+      talker_graph_sampler: true
+      talker_binary_argmax: true
+      talker_fixed_nonfinal_codec_chunks: true
 
 stages:
   - stage_id: 0
     max_num_seqs: 4
     gpu_memory_utilization: 0.55
+    # The vLLM LRU multimodal processor cache mirrors eviction state between
+    # the API and Engine processes.  Concurrent/retried benchmark requests can
+    # arrive at the two processes in a different order, making the API send a
+    # cache-only reference after the Engine has evicted it.  Disable this
+    # input-processing cache for the long-running accuracy/Demo service; this
+    # does not alter model weights, tokens, or multimodal encoder execution.
+    mm_processor_cache_gb: 0
     enforce_eager: false
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
@@ -75,6 +96,14 @@ stages:
       seed: 42
       detokenize: true
       repetition_penalty: 1.0
+    engine_extras:
+      hf_overrides:
+        minicpmo45_runtime_config:
+          stage0_ref_audio_embedding_cache_size: 4
+          stage0_ref_audio_embedding_preload_wavs:
+            - assets/system_ref_audio.wav
+          stage0_ref_audio_embedding_preload_sample_rate: 16000
+          stage0_ref_audio_embedding_preload_frame_samples: 1600
 
   - stage_id: 1
     max_num_seqs: 4

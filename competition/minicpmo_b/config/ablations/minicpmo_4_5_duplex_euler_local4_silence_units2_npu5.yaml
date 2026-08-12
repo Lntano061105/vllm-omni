@@ -1,0 +1,9 @@
+# Combine the validated duplex Talker local-decode x4 path with two one-second
+# silence continuation units per append.  This is an aggressive RTF candidate
+# and must pass the full TTS-Seed and subjective Demo continuity gates.
+base_config: minicpmo_4_5_duplex_euler_local4_zero_wait_npu5.yaml
+pipeline: minicpmo_4_5
+
+duplex_session:
+  native_silence_continuation_delay_ms: 0
+  native_silence_continuation_units_per_append: 2

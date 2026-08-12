@@ -12,6 +12,7 @@ SEED_TTS_EXTRACT_DIR="${SEED_TTS_EXTRACT_DIR:-/tmp/minicpmo_b_seedtts}"
 NUM_PROMPTS="${NUM_PROMPTS:-32}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
 NUM_WARMUPS="${NUM_WARMUPS:-2}"
+BENCHMARK_SEED="${BENCHMARK_SEED:-0}"
 RESULT_DIR="${RESULT_DIR:-${REPO_ROOT}/competition/minicpmo_b/results/optimized}"
 RESULT_FILENAME="${RESULT_FILENAME:-seed_tts_c${MAX_CONCURRENCY}_n${NUM_PROMPTS}.json}"
 
@@ -48,6 +49,7 @@ exec vllm bench serve --omni \
   --extra-body '{"modalities":["text","audio"],"chat_template_kwargs":{"enable_thinking":false,"use_tts_template":true}}' \
   --percentile-metrics ttft,e2el,audio_ttfp,audio_rtf,audio_chunk_rtf,audio_duration,audio_underrun \
   --num-warmups "${NUM_WARMUPS}" \
+  --seed "${BENCHMARK_SEED}" \
   --save-result \
   --result-dir "${RESULT_DIR}" \
   --result-filename "${RESULT_FILENAME}"

@@ -1,0 +1,10 @@
+# Aggressive TTFT/TTFP ablation pinned to physical NPU 5.
+# Submit four one-second native silence units in one Stage-0 append.  This
+# changes the model decision cadence and therefore requires accuracy/Demo
+# gating even if latency improves.
+base_config: minicpmo_4_5_duplex_full_decode_local2_euler_npu5.yaml
+pipeline: minicpmo_4_5
+
+duplex_session:
+  native_silence_continuation_delay_ms: 0
+  native_silence_continuation_units_per_append: 4

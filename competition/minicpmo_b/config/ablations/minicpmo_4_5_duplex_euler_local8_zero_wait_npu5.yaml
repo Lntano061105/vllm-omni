@@ -1,0 +1,26 @@
+# Aggressive native full-duplex Talker local-decode x8 ablation pinned to
+# physical NPU 5.  The runner still stops the local loop immediately when a
+# codec chunk, terminal sample, or unsupported request state is observed.
+base_config: minicpmo_4_5_duplex_euler_local4_zero_wait_npu5.yaml
+pipeline: minicpmo_4_5
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.001
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      code2wav_cache_initial_state: true
+      code2wav_cross_prompt_batching: true
+      code2wav_prewarm: true
+      token2wav_cfg_mode: conditional
+      token2wav_solver: euler
+      token2wav_n_timesteps: 1
+      token2wav_remove_hift_weight_norm: true
+      talker_emit_codec_chunks: true
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 50
+      codec_left_context_frames: 3
+      talker_local_decode_stage_id: 1
+      talker_local_decode_steps: 8

@@ -161,6 +161,52 @@ def test_seed_tts_eval_keeps_session_pcm_for_single_turn_chat():
     assert outputs[0].tts_output_pcm_bytes == pcm
 
 
+def test_seed_tts_eval_checkpoints_audio_before_batch_asr(monkeypatch, tmp_path):
+    """An interrupted Whisper pass must not discard the generation phase."""
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    request = SeedTTSSampleRequest(
+        prompt="target words",
+        prompt_len=2,
+        expected_output_len=100,
+        multi_modal_data=None,
+        request_id="session-0",
+        seed_tts_utterance_id="utt-0",
+        seed_tts_locale="en",
+        seed_tts_ref_wav_path="/dataset/ref.wav",
+    )
+    output = types.SimpleNamespace(
+        success=True,
+        error="",
+        tts_output_pcm_bytes=b"\x00\x00" * 240,
+        tts_turn_pcm_bytes=None,
+    )
+    monkeypatch.setenv("SEED_TTS_WER_SAVE_AUDIO_DIR", str(tmp_path))
+    monkeypatch.setenv("SEED_TTS_WHISPER_BATCH_SIZE", "8")
+    monkeypatch.setattr(seed_tts_eval, "_missing_deps_message", lambda _lang: None)
+    monkeypatch.setattr(
+        seed_tts_eval,
+        "_pcm_s16le_to_f32_16k",
+        lambda *_args, **_kwargs: np.zeros(160, dtype=np.float32),
+    )
+
+    def interrupted_batch(_wavs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(seed_tts_eval, "_transcribe_en_batch_f32_16k", interrupted_batch)
+
+    with pytest.raises(KeyboardInterrupt):
+        seed_tts_eval.compute_seed_tts_wer_metrics([request], [output])
+
+    manifest = tmp_path / "seed_tts_eval_manifest.jsonl"
+    rows = [__import__("json").loads(line) for line in manifest.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["utterance_id"] == "utt-0"
+    assert rows[0]["reference_text"] == "target words"
+    assert rows[0]["request_success"] is True
+    assert Path(rows[0]["audio_path"]).is_file()
+
+
 def test_seed_tts_text_dataset_omits_ref_audio(seed_tts_root, mock_tokenizer):
     ds = SeedTTSTextDataset(
         dataset_path=str(seed_tts_root),
@@ -315,3 +361,117 @@ def test_seed_tts_whisper_transcribe_passes_attention_mask(monkeypatch):
     assert calls["input_features"].device == "cuda:1"
     assert calls["generate_kwargs"]["attention_mask"].device == "cuda:1"
     assert calls["generate_kwargs"]["forced_decoder_ids"] == [(1, 2)]
+
+
+def test_seed_tts_whisper_batch_transcribe_uses_padding_and_attention_mask(
+    monkeypatch,
+):
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    calls = {}
+
+    class FakeTensor:
+        def __init__(self, name: str):
+            self.name = name
+            self.device = None
+
+        def to(self, device):
+            self.device = device
+            return self
+
+    class FakeProcessor:
+        def __call__(
+            self,
+            wavs,
+            *,
+            sampling_rate,
+            return_tensors,
+            padding,
+            return_attention_mask=False,
+        ):
+            calls["batch_size"] = len(wavs)
+            calls["padding"] = padding
+            calls["return_attention_mask"] = return_attention_mask
+            assert sampling_rate == 16000
+            assert return_tensors == "pt"
+            return types.SimpleNamespace(
+                input_features=FakeTensor("features"),
+                attention_mask=FakeTensor("mask"),
+            )
+
+        def get_decoder_prompt_ids(self, *, language, task):
+            assert language == "english"
+            assert task == "transcribe"
+            return [(1, 2)]
+
+        def batch_decode(self, predicted_ids, *, skip_special_tokens):
+            assert skip_special_tokens
+            assert predicted_ids == [[41], [42]]
+            return [" first ", "second"]
+
+    class FakeModel:
+        def generate(self, input_features, **kwargs):
+            calls["input_features"] = input_features
+            calls["generate_kwargs"] = kwargs
+            return [[41], [42]]
+
+    monkeypatch.setattr(seed_tts_eval, "_ensure_en_asr", lambda: None)
+    monkeypatch.setattr(seed_tts_eval, "_en_processor", FakeProcessor())
+    monkeypatch.setattr(seed_tts_eval, "_en_model", FakeModel())
+    monkeypatch.setattr(seed_tts_eval, "_device", "cpu")
+
+    texts = seed_tts_eval._transcribe_en_batch_f32_16k(
+        [np.ones(1600, dtype=np.float32), np.ones(800, dtype=np.float32)]
+    )
+
+    assert texts == ["first", "second"]
+    assert calls["batch_size"] == 2
+    assert calls["padding"] is True
+    assert calls["return_attention_mask"] is True
+    assert calls["input_features"].device == "cpu"
+    assert calls["generate_kwargs"]["attention_mask"].device == "cpu"
+    assert calls["generate_kwargs"]["forced_decoder_ids"] == [(1, 2)]
+
+
+def test_seed_tts_utmos_loads_explicit_local_jit_without_hub(
+    monkeypatch, tmp_path: Path
+):
+    import huggingface_hub
+    import torch
+
+    from vllm_omni.benchmarks.data_modules import seed_tts_eval
+
+    jit_path = tmp_path / "utmos.jit"
+    jit_path.write_bytes(b"local-utmos-placeholder")
+    loaded = {}
+
+    class FakeModel:
+        def eval(self):
+            loaded["eval"] = True
+            return self
+
+    def fake_load(path, *, map_location):
+        loaded["path"] = path
+        loaded["map_location"] = map_location
+        return FakeModel()
+
+    def fail_hub_download(**kwargs):
+        raise AssertionError(f"local UTMOS path unexpectedly used the Hub: {kwargs}")
+
+    monkeypatch.setenv("SEED_TTS_UTMOS_JIT_FILE", str(jit_path))
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fail_hub_download)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(torch.jit, "load", fake_load)
+    monkeypatch.setattr(seed_tts_eval, "_utmos_jit_model", None)
+    monkeypatch.setattr(seed_tts_eval, "_utmos_jit_device", None)
+    monkeypatch.setattr(seed_tts_eval, "_utmos_jit_load_failed", False)
+
+    model = seed_tts_eval._ensure_utmos_jit_model()
+
+    assert isinstance(model, FakeModel)
+    assert loaded == {
+        "path": str(jit_path.resolve()),
+        "map_location": "cpu",
+        "eval": True,
+    }
+    assert seed_tts_eval._utmos_jit_device == "cpu"

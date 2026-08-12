@@ -22,7 +22,8 @@ https://github.com/zhaochenyang20/seed-tts-eval):
   (Sarulab-style demo export). Uses ``torch`` + ``huggingface_hub`` only. Aggregate metrics
   are over **all requests with captured PCM** (independent of ASR/WER). Non-finite scores are
   dropped and counted as failures. Override repo/file via ``SEED_TTS_UTMOS_HF_REPO`` /
-  ``SEED_TTS_UTMOS_JIT_FILE``. **Device**: defaults to **CPU** when ``SEED_TTS_UTMOS_DEVICE``
+  ``SEED_TTS_UTMOS_JIT_FILE``; when that variable names an existing local file it is loaded
+  directly without Hub access. **Device**: defaults to **CPU** when ``SEED_TTS_UTMOS_DEVICE``
   is unset; set ``SEED_TTS_UTMOS_DEVICE=cuda:0`` (or ``cuda:1`` etc.) to run on GPU. The JIT
   model is loaded directly onto the target device via ``map_location`` to avoid cross-device
   issues (some PyTorch builds/Windows have problems moving TorchScript modules after load).
@@ -46,6 +47,7 @@ Streaming PCM is decoded using ``VLLM_OMNI_BENCH_AUDIO_SAMPLE_RATE`` /
 from __future__ import annotations
 
 import io
+import json
 import logging
 import math
 import os
@@ -53,6 +55,7 @@ import statistics
 import string
 import tempfile
 import threading
+import time
 import wave
 from copy import copy
 from dataclasses import replace
@@ -116,6 +119,29 @@ def _save_seed_tts_eval_audio(
     stem = f"{index:05d}_{_safe_filename_part(utterance_id)}_{_safe_filename_part(locale)}"
     path = output_dir / f"{stem}.wav"
     path.write_bytes(pcm_s16le_mono_to_wav_bytes(pcm, sample_rate=24000))
+    return str(path)
+
+
+def _write_seed_tts_eval_manifest(
+    rows: list[dict[str, Any]], *, output_dir: Path | None
+) -> str | None:
+    """Atomically persist the generated-audio checkpoint before slow ASR.
+
+    A full Whisper-large-v3 CPU pass can take hours.  Saving this manifest and
+    its WAV files before ASR makes the expensive generation phase reusable if
+    the evaluator is interrupted or the service must be released.
+    """
+    if output_dir is None:
+        return None
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "seed_tts_eval_manifest.jsonl"
+    tmp = output_dir / f".{path.name}.tmp-{os.getpid()}"
+    with tmp.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
     return str(path)
 
 
@@ -333,12 +359,18 @@ def _ensure_utmos_jit_model() -> Any | None:
 
             repo = os.environ.get("SEED_TTS_UTMOS_HF_REPO", "balacoon/utmos").strip() or "balacoon/utmos"
             fname = os.environ.get("SEED_TTS_UTMOS_JIT_FILE", "utmos.jit").strip() or "utmos.jit"
-            logger.warning(
-                "Loading UTMOS TorchScript from Hugging Face %r file %r (one-time download/cache)...",
-                repo,
-                fname,
-            )
-            path = hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
+            local_path = Path(fname).expanduser()
+            if local_path.is_file():
+                path = str(local_path.resolve())
+                logger.warning("Loading UTMOS TorchScript from local file %r...", path)
+            else:
+                logger.warning(
+                    "Loading UTMOS TorchScript from Hugging Face %r file %r "
+                    "(one-time download/cache)...",
+                    repo,
+                    fname,
+                )
+                path = hf_hub_download(repo_id=repo, filename=fname, repo_type="model")
 
             # TODO The model weights in UTMOS must be loaded in cuda:0; otherwise, the model execution will fail.
             want = "cuda:0"
@@ -491,6 +523,65 @@ def _transcribe_en_f32_16k(wav_f32: np.ndarray) -> str:
     return (text or "").strip()
 
 
+def _transcribe_en_batch_f32_16k(wavs_f32: list[np.ndarray]) -> list[str]:
+    """Transcribe a small English batch with the same Whisper protocol.
+
+    The former one-utterance loop made the complete 1000-row gate take longer
+    than the benchmark host session lifetime on CPU. Whisper's feature
+    extractor already pads inputs to its fixed window; batching with an
+    explicit attention mask preserves greedy decoding while amortizing model
+    dispatch. Callers retain a per-item fallback if a batch raises.
+    """
+    import torch
+
+    _ensure_en_asr()
+    if not wavs_f32:
+        return []
+    with _lock:
+        assert _en_processor is not None and _en_model is not None and _device is not None
+        try:
+            inputs = _en_processor(
+                wavs_f32,
+                sampling_rate=16000,
+                return_tensors="pt",
+                padding=True,
+                return_attention_mask=True,
+            )
+        except TypeError:
+            inputs = _en_processor(
+                wavs_f32,
+                sampling_rate=16000,
+                return_tensors="pt",
+                padding=True,
+            )
+        input_features = inputs.input_features.to(_device)
+        attention_mask = getattr(inputs, "attention_mask", None)
+        if attention_mask is None and isinstance(inputs, dict):
+            attention_mask = inputs.get("attention_mask")
+        generate_kwargs: dict[str, Any] = {}
+        if attention_mask is not None:
+            generate_kwargs["attention_mask"] = attention_mask.to(_device)
+        with torch.no_grad():
+            try:
+                forced = _en_processor.get_decoder_prompt_ids(
+                    language="english", task="transcribe"
+                )
+                predicted_ids = _en_model.generate(
+                    input_features,
+                    forced_decoder_ids=forced,
+                    **generate_kwargs,
+                )
+            except Exception:
+                predicted_ids = _en_model.generate(
+                    input_features,
+                    language="english",
+                    task="transcribe",
+                    **generate_kwargs,
+                )
+        texts = _en_processor.batch_decode(predicted_ids, skip_special_tokens=True)
+    return [(text or "").strip() for text in texts]
+
+
 def _transcribe_zh_wav_path(wav_path: str) -> str:
     import zhconv
 
@@ -615,8 +706,151 @@ def compute_seed_tts_wer_metrics(
     save_audio_dir = Path(save_audio_raw).expanduser() if save_audio_raw else None
     saved_audio = 0
     save_audio_failed = 0
+    eval_started = time.monotonic()
+    progress_interval = max(
+        1, int(os.environ.get("SEED_TTS_EVAL_PROGRESS_INTERVAL", "25"))
+    )
+    en_batch_size = max(1, int(os.environ.get("SEED_TTS_WHISPER_BATCH_SIZE", "8")))
+    checkpoint_audio_paths: dict[int, str] = {}
+    checkpoint_rows: list[dict[str, Any]] = []
+    checkpoint_manifest_path: str | None = None
+    if save_audio_dir is not None:
+        # Checkpoint every generated WAV before loading/running Whisper.  The
+        # previous ordering saved audio only after the all-item batch ASR pass,
+        # so an interruption lost both the result JSON and all reusable PCM.
+        for checkpoint_index, (checkpoint_req, checkpoint_out) in enumerate(
+            zip(input_requests, outputs, strict=True)
+        ):
+            assert isinstance(checkpoint_req, SeedTTSSampleRequest)
+            checkpoint_pcm = getattr(checkpoint_out, "tts_output_pcm_bytes", None)
+            checkpoint_path: str | None = None
+            checkpoint_error: str | None = None
+            if checkpoint_out.success and checkpoint_pcm:
+                try:
+                    checkpoint_path = _save_seed_tts_eval_audio(
+                        checkpoint_pcm,
+                        output_dir=save_audio_dir,
+                        index=checkpoint_index,
+                        utterance_id=checkpoint_req.seed_tts_utterance_id,
+                        locale=checkpoint_req.seed_tts_locale or "en",
+                    )
+                    if checkpoint_path:
+                        checkpoint_audio_paths[checkpoint_index] = checkpoint_path
+                        saved_audio += 1
+                except OSError as e:
+                    save_audio_failed += 1
+                    checkpoint_error = f"{type(e).__name__}: {e}"
+                    logger.warning(
+                        "Seed-TTS checkpoint audio save failed for utterance=%s: %s",
+                        checkpoint_req.seed_tts_utterance_id,
+                        e,
+                    )
+            elif not checkpoint_out.success:
+                checkpoint_error = "request_failed"
+            else:
+                checkpoint_error = "no_pcm"
+            checkpoint_rows.append(
+                {
+                    "index": checkpoint_index,
+                    "utterance_id": checkpoint_req.seed_tts_utterance_id,
+                    "locale": checkpoint_req.seed_tts_locale or "en",
+                    "reference_text": checkpoint_req.prompt,
+                    "reference_wav_path": checkpoint_req.seed_tts_ref_wav_path,
+                    "audio_path": checkpoint_path,
+                    "request_success": bool(checkpoint_out.success),
+                    "request_error": (getattr(checkpoint_out, "error", "") or "")[:500],
+                    "checkpoint_error": checkpoint_error,
+                }
+            )
+        checkpoint_manifest_path = _write_seed_tts_eval_manifest(
+            checkpoint_rows, output_dir=save_audio_dir
+        )
+        logger.info(
+            "Seed-TTS generated-audio checkpoint ready: saved=%d/%d failed=%d manifest=%s",
+            saved_audio,
+            len(input_requests),
+            save_audio_failed,
+            checkpoint_manifest_path,
+        )
+    en_batch_hypotheses: dict[int, str] = {}
+    if lang == "en" and en_batch_size > 1:
+        pending_indexes: list[int] = []
+        pending_wavs: list[np.ndarray] = []
+
+        def flush_en_batch() -> None:
+            if not pending_wavs:
+                return
+            try:
+                hypotheses = _transcribe_en_batch_f32_16k(pending_wavs)
+                if len(hypotheses) != len(pending_indexes):
+                    raise RuntimeError(
+                        "Whisper batch returned "
+                        f"{len(hypotheses)} hypotheses for {len(pending_indexes)} inputs"
+                    )
+                en_batch_hypotheses.update(zip(pending_indexes, hypotheses, strict=True))
+            except Exception:
+                logger.warning(
+                    "Seed-TTS Whisper batch failed for %d turns; falling back to "
+                    "per-item ASR for this batch",
+                    len(pending_indexes),
+                    exc_info=True,
+                )
+                for pending_index, pending_wav in zip(
+                    pending_indexes, pending_wavs, strict=True
+                ):
+                    try:
+                        en_batch_hypotheses[pending_index] = _transcribe_en_f32_16k(
+                            pending_wav
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Seed-TTS ASR failed for prebatched turn index=%d",
+                            pending_index,
+                        )
+                        en_batch_hypotheses[pending_index] = ""
+            pending_indexes.clear()
+            pending_wavs.clear()
+
+        for pre_index, pre_out in enumerate(outputs):
+            if not pre_out.success:
+                continue
+            pre_pcm = getattr(pre_out, "tts_output_pcm_bytes", None)
+            if not pre_pcm:
+                continue
+            pre_wav = _pcm_s16le_to_f32_16k(
+                pre_pcm, pcm_sample_rate=24000, channels=1
+            )
+            if len(pre_wav) == 0:
+                continue
+            pending_indexes.append(pre_index)
+            pending_wavs.append(pre_wav)
+            if len(pending_wavs) >= en_batch_size:
+                flush_en_batch()
+        flush_en_batch()
+        logger.info(
+            "Seed-TTS Whisper batch predecode complete: %d/%d turns, batch_size=%d, "
+            "elapsed=%.1fs",
+            len(en_batch_hypotheses),
+            len(input_requests),
+            en_batch_size,
+            time.monotonic() - eval_started,
+        )
 
     for index, (req, out) in enumerate(zip(input_requests, outputs, strict=True)):
+        if index and index % progress_interval == 0:
+            logger.info(
+                "Seed-TTS quality eval: %d/%d turns, WER ok=%d, request_failed=%d, "
+                "no_pcm=%d, asr_failed=%d, SIM ok=%d, UTMOS ok=%d, elapsed=%.1fs",
+                index,
+                len(input_requests),
+                len(errs),
+                request_failed,
+                no_pcm,
+                asr_failed,
+                len(sim_values),
+                len(utmos_values),
+                time.monotonic() - eval_started,
+            )
         assert isinstance(req, SeedTTSSampleRequest)
         ref = req.prompt
         locale = req.seed_tts_locale or "en"
@@ -649,23 +883,7 @@ def compute_seed_tts_wer_metrics(
                     }
                 )
             continue
-        try:
-            audio_path = _save_seed_tts_eval_audio(
-                pcm,
-                output_dir=save_audio_dir,
-                index=index,
-                utterance_id=req.seed_tts_utterance_id,
-                locale=locale,
-            )
-            if audio_path:
-                saved_audio += 1
-        except OSError as e:
-            save_audio_failed += 1
-            logger.warning(
-                "Seed-TTS WER audio save failed for utterance=%s: %s",
-                req.seed_tts_utterance_id,
-                e,
-            )
+        audio_path = checkpoint_audio_paths.get(index)
 
         # Request functions normalize ``tts_output_pcm_bytes`` to Seed-TTS WER
         # format before it reaches this evaluator: 24 kHz mono int16 PCM.
@@ -714,7 +932,10 @@ def compute_seed_tts_wer_metrics(
 
         try:
             if row_lang == "en":
-                hyp = _transcribe_en_f32_16k(wav_16k)
+                if en_batch_size > 1:
+                    hyp = en_batch_hypotheses.get(index, "")
+                else:
+                    hyp = _transcribe_en_f32_16k(wav_16k)
             else:
                 fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
                 os.close(fd)
@@ -811,6 +1032,20 @@ def compute_seed_tts_wer_metrics(
                 row["utmos"] = utmos_v
             items.append(row)
 
+    logger.info(
+        "Seed-TTS quality eval: %d/%d turns complete, WER ok=%d, request_failed=%d, "
+        "no_pcm=%d, asr_failed=%d, SIM ok=%d, UTMOS ok=%d, elapsed=%.1fs",
+        len(input_requests),
+        len(input_requests),
+        len(errs),
+        request_failed,
+        no_pcm,
+        asr_failed,
+        len(sim_values),
+        len(utmos_values),
+        time.monotonic() - eval_started,
+    )
+
     result: dict[str, Any] = {
         "seed_tts_eval_protocol": "seed-tts-eval",
         "seed_tts_session_count": session_count,
@@ -836,6 +1071,8 @@ def compute_seed_tts_wer_metrics(
     }
     if save_audio_dir is not None:
         result["seed_tts_save_audio_dir"] = str(save_audio_dir)
+    if checkpoint_manifest_path is not None:
+        result["seed_tts_eval_manifest"] = checkpoint_manifest_path
     if include_per_item:
         result["seed_tts_wer_eval_items"] = items
     return result

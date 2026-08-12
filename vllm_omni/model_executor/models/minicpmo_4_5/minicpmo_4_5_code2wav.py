@@ -77,6 +77,25 @@ def _codec_tensor(value: Any, fallback: torch.Tensor) -> torch.Tensor:
     return fallback.reshape(-1).to(dtype=torch.long)
 
 
+def _token2wav_dtype(value: Any, *, name: str) -> torch.dtype:
+    normalized = str(value).strip().lower()
+    aliases = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    dtype = aliases.get(normalized)
+    if dtype is None:
+        raise ValueError(
+            f"MiniCPM-o Code2Wav {name} must be one of "
+            "float32/fp32, float16/fp16, or bfloat16/bf16"
+        )
+    return dtype
+
+
 # Keys the runner stamps on every step regardless of stage input (see
 # OmniGPUModelRunner._preprocess and the NPU _gather_runtime_additional_information
 # override). A step carrying only these has no producer payload at all.
@@ -189,6 +208,21 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
         self._cache_initial_state = bool(extra.get("code2wav_cache_initial_state", False))
         self._cross_prompt_batching = bool(extra.get("code2wav_cross_prompt_batching", False))
+        self._runtime_prompt_cache_size = int(
+            extra.get("code2wav_runtime_prompt_cache_size", 0)
+        )
+        if self._runtime_prompt_cache_size < 0:
+            raise ValueError(
+                "MiniCPM-o Code2Wav code2wav_runtime_prompt_cache_size must be >= 0"
+            )
+        self._cache_runtime_initial_state = bool(
+            extra.get("code2wav_cache_runtime_initial_state", False)
+        )
+        if self._cache_runtime_initial_state and self._runtime_prompt_cache_size == 0:
+            raise ValueError(
+                "MiniCPM-o code2wav_cache_runtime_initial_state requires "
+                "code2wav_runtime_prompt_cache_size > 0"
+            )
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_explicit = "prompt_wav" in extra
         self._default_prompt_wav = str(
@@ -265,6 +299,10 @@ class MiniCPMO45Code2Wav(nn.Module):
         if entry is None:
             entry = _RuntimePrompt(cache_id=cache_id, path=path, owners=set())
             self._runtime_prompts[cache_key] = entry
+        else:
+            # Dict insertion order is used as a tiny LRU for unowned prompt
+            # features. Refresh an existing content-addressed reference on use.
+            self._runtime_prompts[cache_key] = self._runtime_prompts.pop(cache_key)
         prompt_path = Path(entry.path)
         if not prompt_path.is_file():
             with tempfile.NamedTemporaryFile(
@@ -285,6 +323,81 @@ class MiniCPMO45Code2Wav(nn.Module):
             finally:
                 temporary_path.unlink(missing_ok=True)
         return cache_key, entry
+
+    @staticmethod
+    def _load_reference_waveform(
+        prompt_wav: str | Path,
+        *,
+        target_sample_rate: int,
+        frame_samples: int = 0,
+    ) -> tuple[torch.Tensor, int]:
+        if target_sample_rate <= 0:
+            raise ValueError("target_sample_rate must be positive")
+        if frame_samples < 0:
+            raise ValueError("frame_samples must be >= 0")
+        waveform, sample_rate = sf.read(
+            str(prompt_wav),
+            dtype="float32",
+            always_2d=False,
+        )
+        tensor = torch.as_tensor(waveform, dtype=torch.float32)
+        if tensor.ndim > 1:
+            tensor = tensor.mean(dim=-1)
+        tensor = tensor.reshape(-1)
+        if int(sample_rate) != target_sample_rate and tensor.numel() > 0:
+            import torchaudio
+
+            tensor = torchaudio.functional.resample(
+                tensor.unsqueeze(0),
+                int(sample_rate),
+                target_sample_rate,
+            ).squeeze(0)
+        if frame_samples > 0:
+            usable = (int(tensor.numel()) // frame_samples) * frame_samples
+            tensor = tensor[:usable]
+        return tensor.contiguous(), target_sample_rate
+
+    def _preload_runtime_prompts(
+        self,
+        prompt_wavs: Sequence[Any],
+        *,
+        target_sample_rate: int,
+        frame_samples: int,
+    ) -> None:
+        if self.backend is None:
+            raise RuntimeError("Code2Wav backend must exist before prompt preload")
+        if prompt_wavs and self._runtime_prompt_cache_size == 0:
+            raise ValueError(
+                "code2wav_runtime_prompt_preload_wavs requires "
+                "code2wav_runtime_prompt_cache_size > 0"
+            )
+        for raw_prompt_wav in prompt_wavs:
+            prompt_path = Path(str(raw_prompt_wav))
+            if not prompt_path.is_absolute():
+                prompt_path = Path(self.model_path) / prompt_path
+            if not prompt_path.is_file():
+                raise FileNotFoundError(
+                    f"MiniCPM-o runtime prompt preload not found: {prompt_path}"
+                )
+            waveform, sample_rate = self._load_reference_waveform(
+                prompt_path,
+                target_sample_rate=target_sample_rate,
+                frame_samples=frame_samples,
+            )
+            _, entry = self._materialize_runtime_prompt(waveform, sample_rate)
+            self.backend.prepare_prompt(entry.cache_id, entry.path)
+            if self._cache_runtime_initial_state:
+                self.backend.setup_cached_batch(entry.cache_id, entry.path, 1)
+            logger.info(
+                "Preloaded MiniCPM-o runtime prompt: source=%s cache_id=%s "
+                "samples=%d sample_rate=%d initial_state=%s",
+                prompt_path,
+                entry.cache_id,
+                waveform.numel(),
+                sample_rate,
+                self._cache_runtime_initial_state,
+            )
+        self._prune_unowned_runtime_prompts()
 
     def _resolve_prompt(
         self,
@@ -324,6 +437,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         entry.owners.discard(state_id)
         if entry.owners:
             return
+        if self._runtime_prompt_cache_size > 0:
+            self._runtime_prompts[cache_key] = self._runtime_prompts.pop(cache_key)
+            self._prune_unowned_runtime_prompts()
+            return
+        self._evict_runtime_prompt(cache_key, entry)
+
+    def _evict_runtime_prompt(self, cache_key: str, entry: _RuntimePrompt) -> None:
         if self.backend is not None:
             self.backend.evict_prompt(entry.cache_id, entry.path)
         Path(entry.path).unlink(missing_ok=True)
@@ -343,21 +463,30 @@ class MiniCPMO45Code2Wav(nn.Module):
                 self._request_prompt_keys[item.state_id] = cache_key
 
     def _use_cached_initial_state(self, item: _WorkItem) -> bool:
-        """Cache the persistent default voice, not one-shot runtime references."""
+        """Reuse immutable prompt state only for explicitly persistent voices."""
         return (
-            self._cache_initial_state
-            and item.prompt_cache_id == self._default_prompt_id
-            and item.prompt_wav == self._default_prompt_wav
+            (
+                self._cache_initial_state
+                and item.prompt_cache_id == self._default_prompt_id
+                and item.prompt_wav == self._default_prompt_wav
+            )
+            or (
+                self._cache_runtime_initial_state
+                and item.runtime_prompt_key is not None
+            )
         )
 
     def _prune_unowned_runtime_prompts(self) -> None:
-        for cache_key, entry in list(self._runtime_prompts.items()):
-            if entry.owners:
-                continue
-            if self.backend is not None:
-                self.backend.evict_prompt(entry.cache_id, entry.path)
-            Path(entry.path).unlink(missing_ok=True)
-            self._runtime_prompts.pop(cache_key, None)
+        unowned = sum(not entry.owners for entry in self._runtime_prompts.values())
+        while unowned > self._runtime_prompt_cache_size:
+            for cache_key, entry in list(self._runtime_prompts.items()):
+                if entry.owners:
+                    continue
+                self._evict_runtime_prompt(cache_key, entry)
+                unowned -= 1
+                break
+            else:
+                break
 
     @staticmethod
     def _split_segments(input_ids: torch.Tensor, counts: Any) -> list[torch.Tensor]:
@@ -872,7 +1001,22 @@ class MiniCPMO45Code2Wav(nn.Module):
         while len(self._completed_outputs) > self._completed_output_limit:
             self._completed_outputs.pop(next(iter(self._completed_outputs)))
         if self._debug_stream_state:
-            logger.warning("Code2Wav state trace commit live=%s", sorted(self._states))
+            logger.warning(
+                "Code2Wav state trace commit live=%s outputs=%s",
+                sorted(self._states),
+                [
+                    {
+                        "request_id": item.request_id,
+                        "chunk": item.chunk_seq,
+                        "audio_samples": int(outputs[item.output_index].numel()),
+                        "text_bytes": int(item.segment_text_utf8.numel()),
+                        "tts_last": item.tts_is_last_chunk,
+                        "speak_tail": item.speak_tail,
+                        "turn_end": item.turn_end,
+                    }
+                    for item in items
+                ],
+            )
         sample_rate_tensor = torch.as_tensor(sample_rate, dtype=torch.int32)
         return OmniOutput(
             text_hidden_states=None,
@@ -952,7 +1096,24 @@ class MiniCPMO45Code2Wav(nn.Module):
         token2wav_path = model_root / "assets" / "token2wav"
         if not token2wav_path.is_dir():
             raise FileNotFoundError(f"MiniCPM-o Code2Wav assets not found: {token2wav_path}")
-        use_float16 = bool(extra.get("token2wav_float16", False))
+        legacy_float16 = bool(extra.get("token2wav_float16", False))
+        flow_dtype = _token2wav_dtype(
+            extra.get(
+                "token2wav_flow_dtype",
+                "float16" if legacy_float16 else "float32",
+            ),
+            name="token2wav_flow_dtype",
+        )
+        hift_dtype = _token2wav_dtype(
+            extra.get("token2wav_hift_dtype", "float32"),
+            name="token2wav_hift_dtype",
+        )
+        if legacy_float16 and flow_dtype != torch.float16:
+            raise ValueError(
+                "MiniCPM-o Code2Wav token2wav_float16=true conflicts with "
+                f"token2wav_flow_dtype={flow_dtype}"
+            )
+        use_float16 = flow_dtype == torch.float16
         previous_dtype = torch.get_default_dtype()
         try:
             # vLLM constructs bf16 models under a bf16 default-dtype context.
@@ -1001,8 +1162,21 @@ class MiniCPMO45Code2Wav(nn.Module):
                 "Baked %d HiFT weight-norm parametrizations for inference",
                 removed,
             )
+        flow_parameter = next(token2wav.flow.parameters(), None)
+        if flow_parameter is not None and flow_parameter.dtype != flow_dtype:
+            token2wav.flow.to(dtype=flow_dtype)
+        hift_parameter = next(token2wav.hift.parameters(), None)
+        if hift_parameter is not None and hift_parameter.dtype != hift_dtype:
+            token2wav.hift.to(dtype=hift_dtype)
         cfg_mode = str(extra.get("token2wav_cfg_mode", "full"))
         solver = str(extra.get("token2wav_solver", "euler"))
+        steady_npugraph = bool(extra.get("token2wav_steady_npugraph", False))
+        code2wav_prewarm = bool(extra.get("code2wav_prewarm", False))
+        if steady_npugraph and not code2wav_prewarm:
+            raise ValueError(
+                "MiniCPM-o token2wav_steady_npugraph requires "
+                "code2wav_prewarm=true so graph capture stays off the first-request path"
+            )
         self.backend = BatchedToken2Wav(
             token2wav,
             cfg_mode=cfg_mode,
@@ -1010,20 +1184,43 @@ class MiniCPMO45Code2Wav(nn.Module):
             prompt_bucket_frames=int(extra.get("code2wav_prompt_bucket_frames", 0)),
             prompt_encoder_device=extra.get("code2wav_prompt_encoder_device"),
         )
+        runtime_prompt_preloads = extra.get(
+            "code2wav_runtime_prompt_preload_wavs",
+            [],
+        )
+        if isinstance(runtime_prompt_preloads, (str, os.PathLike)):
+            runtime_prompt_preloads = [runtime_prompt_preloads]
+        if not isinstance(runtime_prompt_preloads, (list, tuple)):
+            raise ValueError("code2wav_runtime_prompt_preload_wavs must be a path list")
+        self._preload_runtime_prompts(
+            runtime_prompt_preloads,
+            target_sample_rate=int(
+                extra.get("code2wav_runtime_prompt_preload_sample_rate", 16000)
+            ),
+            frame_samples=int(
+                extra.get("code2wav_runtime_prompt_preload_frame_samples", 0)
+            ),
+        )
         logger.info(
             "MiniCPM-o Code2Wav backend ready: solver=%s solver_steps=%d "
-            "estimator_evaluations=%d cached_dit_modulation=%s float16=%s "
-            "cfg_mode=%s hift_weight_norm_removed=%s cache_initial_state=%s",
+            "estimator_evaluations=%d cached_dit_modulation=%s flow_dtype=%s hift_dtype=%s "
+            "cfg_mode=%s hift_weight_norm_removed=%s cache_initial_state=%s "
+            "runtime_prompt_cache_size=%d cache_runtime_initial_state=%s "
+            "steady_npugraph=%s",
             solver,
             self.backend.n_timesteps,
             self.backend.num_evaluations,
             self.backend.cached_dit_modulation,
-            use_float16,
+            flow_dtype,
+            hift_dtype,
             cfg_mode,
             remove_hift_weight_norm,
             self._cache_initial_state,
+            self._runtime_prompt_cache_size,
+            self._cache_runtime_initial_state,
+            steady_npugraph,
         )
-        if bool(extra.get("code2wav_prewarm", False)):
+        if code2wav_prewarm:
             self._prewarm_backend(extra, current_omni_platform)
 
     def _prewarm_backend(self, extra: Mapping[str, Any], platform: Any) -> None:
@@ -1080,30 +1277,238 @@ class MiniCPMO45Code2Wav(nn.Module):
                 )
             self.backend.setup_batch(bucket_features, 1)
 
+        def advance_live_shapes(
+            prompt_features: PromptFeatures,
+            prompt_states: list[BatchedToken2WavState],
+        ) -> list[BatchedToken2WavState]:
+            prompt_device = prompt_features.speech_tokens.device
+            for new_frames in live_chunk_sizes:
+                tokens = torch.full(
+                    (1, left_context_frames + new_frames),
+                    4218,
+                    dtype=torch.long,
+                    device=prompt_device,
+                )
+                # Model loading is not necessarily entered under the same
+                # dispatch-key state as V1 execute_model. Warm under inference
+                # mode so Ascend compiles the exact operator variants used by
+                # the first live request instead of a separate autograd path.
+                with torch.inference_mode():
+                    _, prompt_states = self.backend.decode_batch(
+                        tokens,
+                        prompt_features,
+                        prompt_states,
+                        last_chunk=False,
+                    )
+            return prompt_states
+
         features, states = self.backend.setup_cached_batch(
             self._default_prompt_id,
             self._default_prompt_wav,
             1,
         )
-        device = features.speech_tokens.device
-        for new_frames in live_chunk_sizes:
-            tokens = torch.full(
-                (1, left_context_frames + new_frames),
-                4218,
-                dtype=torch.long,
-                device=device,
+        states = advance_live_shapes(features, states)
+        runtime_prompt_count = 0
+        for entry in self._runtime_prompts.values():
+            runtime_features = self.backend.prepare_prompt(
+                entry.cache_id,
+                entry.path,
             )
-            _, states = self.backend.decode_batch(
-                tokens,
-                features,
-                states,
-                last_chunk=False,
+            if self._cache_runtime_initial_state:
+                _, runtime_states = self.backend.setup_cached_batch(
+                    entry.cache_id,
+                    entry.path,
+                    1,
+                )
+            else:
+                runtime_states = self.backend.setup_batch(runtime_features, 1)
+            advance_live_shapes(runtime_features, runtime_states)
+            runtime_prompt_count += 1
+
+        steady_npugraph = bool(extra.get("token2wav_steady_npugraph", False))
+        graph_warmup_steps = 0
+        graph_prompt_wavs: list[str] = []
+        if steady_npugraph:
+            if not platform.is_npu():
+                raise ValueError("token2wav_steady_npugraph is only supported on NPU")
+            raw_graph_prompt_wavs = extra.get("code2wav_npugraph_prompt_wavs", [])
+            if isinstance(raw_graph_prompt_wavs, (str, os.PathLike)):
+                raw_graph_prompt_wavs = [raw_graph_prompt_wavs]
+            if not isinstance(raw_graph_prompt_wavs, (list, tuple)):
+                raise ValueError("code2wav_npugraph_prompt_wavs must be a path list")
+            graph_prompt_wavs = [str(path) for path in raw_graph_prompt_wavs]
+            graph_prompt_sample_rate = int(
+                extra.get("code2wav_npugraph_prompt_sample_rate", 16000)
             )
+            graph_prompt_frame_samples = int(
+                extra.get("code2wav_npugraph_prompt_frame_samples", 0)
+            )
+
+            def capture_prompt_graph(
+                prompt_features: PromptFeatures,
+                prompt_states: list[BatchedToken2WavState],
+            ) -> int:
+                steady_tokens = torch.full(
+                    (1, left_context_frames + steady_frames),
+                    4218,
+                    dtype=torch.long,
+                    device=prompt_features.speech_tokens.device,
+                )
+                previous_signature = state_shape_signature(prompt_states[0])
+                stable_repeats = 0
+                for warmup_step in range(1, 21):
+                    _, prompt_states = self.backend.decode_batch(
+                        steady_tokens,
+                        prompt_features,
+                        prompt_states,
+                        last_chunk=False,
+                    )
+                    signature = state_shape_signature(prompt_states[0])
+                    if signature == previous_signature:
+                        stable_repeats += 1
+                        if stable_repeats >= 2:
+                            self.backend.capture_steady_npugraph(
+                                steady_tokens,
+                                prompt_features,
+                                prompt_states[0],
+                            )
+                            return warmup_step
+                    else:
+                        stable_repeats = 0
+                    previous_signature = signature
+                raise RuntimeError(
+                    "MiniCPM-o Token2Wav cache shapes did not stabilize within "
+                    "20 steady chunks; refusing NPUGraph capture"
+                )
+
+            graph_warmup_steps += capture_prompt_graph(features, states)
+            for index, raw_prompt_wav in enumerate(graph_prompt_wavs):
+                prompt_path = Path(raw_prompt_wav)
+                if not prompt_path.is_absolute():
+                    prompt_path = Path(self.model_path) / prompt_path
+                if not prompt_path.is_file():
+                    raise FileNotFoundError(
+                        f"MiniCPM-o NPUGraph prewarm prompt not found: {prompt_path}"
+                    )
+                if graph_prompt_frame_samples > 0:
+                    graph_waveform, graph_sample_rate = self._load_reference_waveform(
+                        prompt_path,
+                        target_sample_rate=graph_prompt_sample_rate,
+                        frame_samples=graph_prompt_frame_samples,
+                    )
+                    _, graph_entry = self._materialize_runtime_prompt(
+                        graph_waveform,
+                        graph_sample_rate,
+                    )
+                    graph_prompt_id = graph_entry.cache_id
+                    graph_prompt_path = graph_entry.path
+                else:
+                    graph_prompt_id = f"npugraph-prewarm-{index}"
+                    graph_prompt_path = str(prompt_path)
+                graph_features = self.backend.prepare_prompt(
+                    graph_prompt_id,
+                    graph_prompt_path,
+                )
+                graph_states = self.backend.setup_batch(graph_features, 1)
+                graph_states = advance_live_shapes(graph_features, graph_states)
+                graph_warmup_steps += capture_prompt_graph(
+                    graph_features,
+                    graph_states,
+                )
+            self._prune_unowned_runtime_prompts()
         platform.synchronize()
         logger.info(
             "MiniCPM-o Code2Wav prewarm completed for prompt buckets %s, "
-            "live codec chunks %s with %d left-context frames",
+            "live codec chunks %s with %d left-context frames; "
+            "runtime_prompts=%d steady_npugraph=%s graph_warmup_steps=%d graph_prompt_wavs=%s "
+            "graph_buckets=%d",
             prompt_buckets,
+            live_chunk_sizes,
+            left_context_frames,
+            runtime_prompt_count,
+            steady_npugraph,
+            graph_warmup_steps,
+            graph_prompt_wavs,
+            self.backend.steady_npugraph_bucket_count,
+        )
+
+    def runner_prewarm(self) -> None:
+        """Run live-shaped packets after the NPU ModelRunner owns the model."""
+        if self.backend is None:
+            return
+        extra = self._extra_config()
+        if not bool(extra.get("code2wav_runner_prewarm", False)):
+            return
+        steady_frames = int(extra.get("codec_chunk_frames", 25))
+        initial_frames = int(extra.get("initial_codec_chunk_frames", 0) or 0)
+        left_context_frames = int(extra.get("codec_left_context_frames", 3))
+        initial_frames = min(initial_frames, steady_frames)
+        live_chunk_sizes = (
+            [initial_frames, steady_frames]
+            if 0 < initial_frames < steady_frames
+            else [steady_frames]
+        )
+        prompt_entries = list(self._runtime_prompts.values())
+        if not prompt_entries:
+            return
+        device = self.backend.flow_device
+        warmed_prompts = 0
+        for prompt_index, entry in enumerate(prompt_entries):
+            waveform, sample_rate = sf.read(
+                entry.path,
+                dtype="float32",
+                always_2d=False,
+            )
+            waveform_tensor = torch.as_tensor(
+                waveform,
+                dtype=torch.float32,
+            ).reshape(-1)
+            state_id = f"__minicpmo45_runner_prewarm_{prompt_index}__"
+            try:
+                for chunk_seq, new_frames in enumerate(live_chunk_sizes):
+                    wire_frames = left_context_frames + new_frames
+                    tokens = torch.full(
+                        (wire_frames,),
+                        4218,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    info: dict[str, Any] = {
+                        "codes": {"audio": tokens},
+                        "meta": {
+                            "request_id": state_id,
+                            "cache_epoch": 0,
+                            "chunk_seq": chunk_seq,
+                            "code_flat_numel": wire_frames,
+                            "last_chunk": False,
+                            "tts_is_last_chunk": False,
+                            "duplex_epoch": 0,
+                            "duplex_turn_id": 0,
+                            "ref_audio_sr": int(sample_rate),
+                        },
+                        "request_id": state_id,
+                    }
+                    if chunk_seq == 0:
+                        info["codes"]["ref"] = waveform_tensor
+                    with torch.inference_mode():
+                        self.forward(
+                            input_ids=tokens,
+                            runtime_additional_information=[info],
+                            seq_token_counts=[wire_frames],
+                            request_ids=[state_id],
+                        )
+                warmed_prompts += 1
+            finally:
+                self._states.pop(state_id, None)
+                self._completed_outputs.pop(state_id, None)
+                self._release_request_prompt(state_id)
+        from vllm_omni.platforms import current_omni_platform
+
+        current_omni_platform.synchronize()
+        logger.info(
+            "MiniCPM-o Code2Wav runner prewarm completed: prompts=%d "
+            "live codec chunks=%s left_context=%d",
+            warmed_prompts,
             live_chunk_sizes,
             left_context_frames,
         )

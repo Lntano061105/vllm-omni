@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -19,8 +20,15 @@ from typing import Any, Callable
 
 import torch
 
+# Some competition images install librosa under a read-only site-packages
+# location that Numba cannot use as a cache locator. Keep profiler imports and
+# first-run compilation reproducible without requiring root filesystem writes.
+os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/vllm_omni_numba_cache")
+
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    BatchedToken2WavState,
+    state_shape_signature,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_token2wav import (
     MiniCPMO45Token2wav,
@@ -224,6 +232,203 @@ def _profile_cold_prompt(
     }
 
 
+def _clone_state(state: BatchedToken2WavState) -> BatchedToken2WavState:
+    return BatchedToken2WavState(
+        flow_cache={name: tensor.clone() for name, tensor in state.flow_cache.items()},
+        hift_cache={name: tensor.clone() for name, tensor in state.hift_cache.items()},
+    )
+
+
+def _max_state_error(
+    left: BatchedToken2WavState,
+    right: BatchedToken2WavState,
+) -> dict[str, float]:
+    errors: dict[str, float] = {}
+    for cache_name in ("flow_cache", "hift_cache"):
+        left_cache = getattr(left, cache_name)
+        right_cache = getattr(right, cache_name)
+        for name, left_tensor in left_cache.items():
+            right_tensor = right_cache[name]
+            key = f"{cache_name}.{name}"
+            errors[key] = float(
+                (left_tensor.float() - right_tensor.float()).abs().max().item()
+            )
+    return errors
+
+
+def _profile_steady_npugraph(
+    adapter: BatchedToken2Wav,
+    *,
+    prompt_id: str,
+    prompt_wav: str,
+    initial_frames: int,
+    steady_frames: int,
+    warmups: int,
+    iterations: int,
+) -> dict[str, Any]:
+    """Compare eager Stage 2 with the production exact-shape NPUGraph path.
+
+    Timings include request-state input copies, graph replay, output clones,
+    and the synchronization used by production dispatch.
+    """
+    if adapter.flow_device.type != "npu":
+        raise ValueError("--compare-steady-npugraph requires an NPU device")
+    if iterations < 1:
+        raise ValueError("--iterations must be >= 1")
+
+    features, states = adapter.setup_cached_batch(prompt_id, prompt_wav, 1)
+    lookahead = adapter._pre_lookahead_len() or 0
+    initial_tokens = torch.full(
+        (1, lookahead + initial_frames),
+        4218,
+        dtype=torch.long,
+        device=features.speech_tokens.device,
+    )
+    steady_tokens = torch.full(
+        (1, lookahead + steady_frames),
+        4218,
+        dtype=torch.long,
+        device=features.speech_tokens.device,
+    )
+    _, states = adapter.decode_batch(
+        initial_tokens,
+        features,
+        states,
+        last_chunk=False,
+    )
+
+    # Reach the capped attention-cache state. Require two consecutive equal
+    # signatures rather than assuming a prompt length or upsample factor.
+    previous_signature = None
+    stable_repeats = 0
+    warmup_steps = 0
+    for _ in range(max(20, warmups + 2)):
+        _, states = adapter.decode_batch(
+            steady_tokens,
+            features,
+            states,
+            last_chunk=False,
+        )
+        warmup_steps += 1
+        signature = state_shape_signature(states[0])
+        if signature == previous_signature:
+            stable_repeats += 1
+            if stable_repeats >= 2 and warmup_steps >= warmups:
+                break
+        else:
+            stable_repeats = 0
+        previous_signature = signature
+    else:
+        raise RuntimeError("Token2Wav cache shapes did not stabilize within 20 steady chunks")
+    _synchronize(adapter.flow_device)
+
+    base_state = _clone_state(states[0])
+    eager_state = _clone_state(base_state)
+    graph_state = _clone_state(base_state)
+
+    # Warm one eager transition so both paths start timed iteration 0 after
+    # the graph capture's transition from the same base state.
+    eager_audio_rows, eager_states = adapter._decode_batch_eager(
+        steady_tokens,
+        features,
+        [eager_state],
+        last_chunk=False,
+    )
+    eager_audio = eager_audio_rows[0]
+    eager_state = eager_states[0]
+
+    adapter.capture_steady_npugraph(
+        steady_tokens,
+        features,
+        graph_state,
+    )
+    graph_audio_rows, graph_states = adapter.decode_batch(
+        steady_tokens,
+        features,
+        [graph_state],
+        last_chunk=False,
+    )
+    graph_audio = graph_audio_rows[0]
+    graph_state = graph_states[0]
+    _synchronize(adapter.flow_device)
+
+    if state_shape_signature(base_state) != state_shape_signature(graph_state):
+        raise RuntimeError(
+            "steady NPUGraph input/output cache shapes differ: "
+            f"input={state_shape_signature(base_state)!r} "
+            f"output={state_shape_signature(graph_state)!r}"
+        )
+
+    initial_audio_error = float(
+        (eager_audio.float() - graph_audio.float()).abs().max().item()
+    )
+    initial_state_errors = _max_state_error(eager_state, graph_state)
+
+    eager_wall_ms: list[float] = []
+    for _ in range(iterations):
+        _synchronize(adapter.flow_device)
+        started = time.perf_counter()
+        eager_audio_rows, eager_states = adapter._decode_batch_eager(
+            steady_tokens,
+            features,
+            [eager_state],
+            last_chunk=False,
+        )
+        _synchronize(adapter.flow_device)
+        eager_wall_ms.append((time.perf_counter() - started) * 1000.0)
+        eager_audio = eager_audio_rows[0]
+        eager_state = eager_states[0]
+
+    graph_wall_ms: list[float] = []
+    for _ in range(iterations):
+        _synchronize(adapter.flow_device)
+        started = time.perf_counter()
+        graph_audio_rows, graph_states = adapter.decode_batch(
+            steady_tokens,
+            features,
+            [graph_state],
+            last_chunk=False,
+        )
+        graph_wall_ms.append((time.perf_counter() - started) * 1000.0)
+        graph_audio = graph_audio_rows[0]
+        graph_state = graph_states[0]
+
+    final_audio_error = float(
+        (eager_audio.float() - graph_audio.float()).abs().max().item()
+    )
+    final_state_errors = _max_state_error(eager_state, graph_state)
+    eager_mean = sum(eager_wall_ms) / len(eager_wall_ms)
+    graph_mean = sum(graph_wall_ms) / len(graph_wall_ms)
+    audio_seconds = steady_frames / 25.0
+    return {
+        "prompt_id": prompt_id,
+        "prompt_wav": prompt_wav,
+        "initial_frames": initial_frames,
+        "steady_frames": steady_frames,
+        "captured_token_frames": int(steady_tokens.shape[1]),
+        "warmup_steps_to_stable_shape": warmup_steps,
+        "iterations": iterations,
+        "cache_signature": str(state_shape_signature(base_state)),
+        "eager_wall_ms": {
+            "mean": eager_mean,
+            "min": min(eager_wall_ms),
+            "max": max(eager_wall_ms),
+        },
+        "npugraph_wall_ms": {
+            "mean": graph_mean,
+            "min": min(graph_wall_ms),
+            "max": max(graph_wall_ms),
+        },
+        "speedup": eager_mean / graph_mean,
+        "eager_rtf": eager_mean / (audio_seconds * 1000.0),
+        "npugraph_rtf": graph_mean / (audio_seconds * 1000.0),
+        "initial_audio_max_abs_error": initial_audio_error,
+        "initial_state_max_abs_errors": initial_state_errors,
+        "final_audio_max_abs_error": final_audio_error,
+        "final_state_max_abs_errors": final_state_errors,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default="/workspace/MiniCPM-o-4_5")
@@ -237,6 +442,19 @@ def main() -> None:
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--compare-remove-weight-norm", action="store_true")
+    parser.add_argument(
+        "--compare-steady-npugraph",
+        action="store_true",
+        help=(
+            "Capture the fixed-shape single-request steady Token2Wav transition "
+            "as an NPU graph and compare wall time plus recurrent-state parity."
+        ),
+    )
+    parser.add_argument(
+        "--npugraph-only",
+        action="store_true",
+        help="With --compare-steady-npugraph, skip the regular component profile.",
+    )
     parser.add_argument(
         "--disable-jit-compile",
         action="store_true",
@@ -260,6 +478,13 @@ def main() -> None:
     )
     parser.add_argument("--output")
     args = parser.parse_args()
+    if args.npugraph_only and not args.compare_steady_npugraph:
+        parser.error("--npugraph-only requires --compare-steady-npugraph")
+    if args.compare_steady_npugraph and args.compare_remove_weight_norm:
+        parser.error(
+            "--compare-steady-npugraph already removes HiFT weight norm; "
+            "do not combine it with --compare-remove-weight-norm"
+        )
 
     if args.cpu_threads is not None:
         if args.cpu_threads < 1:
@@ -311,6 +536,30 @@ def main() -> None:
             device=torch.device(args.encoder_device),
             dtype=encoder_dtype,
         )
+    npugraph_payload = None
+    if args.compare_steady_npugraph:
+        removed = _remove_weight_norm_for_inference(adapter.hift)
+        with torch.inference_mode():
+            npugraph_payload = _profile_steady_npugraph(
+                adapter,
+                prompt_id="HT_ref_audio",
+                prompt_wav=prompt_wav,
+                initial_frames=args.initial_frames,
+                steady_frames=args.steady_frames,
+                warmups=args.warmups,
+                iterations=args.iterations,
+            )
+        npugraph_payload["removed_weight_norm_modules"] = removed
+        if args.npugraph_only:
+            encoded = json.dumps(
+                {"steady_npugraph": npugraph_payload},
+                indent=2,
+                sort_keys=True,
+            )
+            print(encoded)
+            if args.output:
+                Path(args.output).write_text(encoded + "\n", encoding="utf-8")
+            return
     profiler = EventProfiler()
     if args.profile_encoder_components:
         _instrument_encoder(adapter, profiler)
@@ -342,6 +591,8 @@ def main() -> None:
             "cold_prompts": cold_prompts,
             "before_remove_weight_norm": before,
         }
+        if npugraph_payload is not None:
+            payload["steady_npugraph"] = npugraph_payload
         if args.compare_remove_weight_norm:
             removed = _remove_weight_norm_for_inference(adapter.hift)
             if removed == 0:
