@@ -335,8 +335,23 @@ def _build_complete_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         )
 
     demo = root / "demo"
-    _write(demo / "server.log")
-    _write(demo / "demo.mp4")
+    _write(demo / "server.log", "Application startup complete.\nclean shutdown\n")
+    (demo / "demo.mp4").write_bytes(
+        b"\x00\x00\x00\x18ftypmp42" + b"demo-recording" * 8
+    )
+    scenarios = {}
+    for name in ("text", "audio", "video", "text_audio"):
+        evidence_name = f"scenario_{name}.json"
+        _write_json(demo / evidence_name, {"scenario": name, "completed": True})
+        scenario = {
+            "passed": True,
+            "evidence_file": evidence_name,
+            "request_count": 1,
+            "completed_response_count": 1,
+        }
+        if name != "text":
+            scenario["audio_packet_count"] = 4
+        scenarios[name] = scenario
     _write_json(
         demo / "demo_evidence.json",
         {
@@ -345,14 +360,19 @@ def _build_complete_tree(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             "finished_utc": "2026-08-12T00:30:00Z",
             "continuous_run_minutes": 30,
             "service_log": "server.log",
+            "service_log_sha256": hashlib.sha256(
+                (demo / "server.log").read_bytes()
+            ).hexdigest(),
             "video_file": "demo.mp4",
+            "video_sha256": hashlib.sha256(
+                (demo / "demo.mp4").read_bytes()
+            ).hexdigest(),
             "service_exit_clean": True,
             "unexpected_error_count": 0,
             "audio_interruption_count": 0,
             "empty_audio_packet_count": 0,
-            "scenarios": {
-                name: {"passed": True} for name in ("text", "audio", "video", "text_audio")
-            },
+            "audio_underrun_count": 0,
+            "scenarios": scenarios,
         },
     )
 
@@ -449,6 +469,64 @@ def test_rejects_910b_style_or_incomplete_demo_evidence(tmp_path: Path) -> None:
     assert result["passed"] is False
     assert any("single visible 910C" in item for item in result["failures"])
     assert any("scenario did not pass: video" in item for item in result["failures"])
+
+
+def test_rejects_demo_fatal_log_fake_video_and_tampered_hash(tmp_path: Path) -> None:
+    root, demo, source, report = _build_complete_tree(tmp_path)
+    _write(demo / "server.log", "Traceback (most recent call last):\nboom\n")
+    (demo / "demo.mp4").write_bytes(b"not a playable recording")
+    manifest = json.loads((demo / "demo_evidence.json").read_text())
+    manifest["service_log_sha256"] = hashlib.sha256(
+        (demo / "server.log").read_bytes()
+    ).hexdigest()
+    manifest["video_sha256"] = "0" * 64
+    _write_json(demo / "demo_evidence.json", manifest)
+
+    result = _MOD.audit(result_root=root, demo_root=demo, source_root=source, report=report)
+    assert result["passed"] is False
+    assert any("service_log contains fatal error markers" in item for item in result["failures"])
+    assert any("video_file SHA256 mismatch" in item for item in result["failures"])
+    assert any("not recognizable MP4/WebM" in item for item in result["failures"])
+
+
+def test_rejects_demo_incomplete_scenario_and_invalid_timeline(tmp_path: Path) -> None:
+    root, demo, source, report = _build_complete_tree(tmp_path)
+    manifest = json.loads((demo / "demo_evidence.json").read_text())
+    manifest["started_utc"] = "2026-08-12T00:00:00"
+    manifest["finished_utc"] = "2026-08-12T00:01:00Z"
+    manifest["continuous_run_minutes"] = 30
+    manifest["scenarios"]["audio"]["completed_response_count"] = 0
+    manifest["scenarios"]["video"]["audio_packet_count"] = 0
+    manifest["scenarios"]["text_audio"]["evidence_file"] = "../escape.json"
+    _write_json(demo / "demo_evidence.json", manifest)
+
+    result = _MOD.audit(result_root=root, demo_root=demo, source_root=source, report=report)
+    assert result["passed"] is False
+    assert any("timezone-aware" in item for item in result["failures"])
+    assert any("audio completed_response_count=0" in item for item in result["failures"])
+    assert any("video audio_packet_count must be positive" in item for item in result["failures"])
+    assert any("text_audio evidence_file escapes demo root" in item for item in result["failures"])
+
+
+def test_rejects_demo_boolean_counts_and_reused_scenario_evidence(
+    tmp_path: Path,
+) -> None:
+    root, demo, source, report = _build_complete_tree(tmp_path)
+    manifest = json.loads((demo / "demo_evidence.json").read_text())
+    manifest["continuous_run_minutes"] = True
+    manifest["scenarios"]["text"]["request_count"] = True
+    manifest["scenarios"]["audio"]["audio_packet_count"] = True
+    manifest["scenarios"]["video"]["evidence_file"] = manifest["scenarios"][
+        "audio"
+    ]["evidence_file"]
+    _write_json(demo / "demo_evidence.json", manifest)
+
+    result = _MOD.audit(result_root=root, demo_root=demo, source_root=source, report=report)
+    assert result["passed"] is False
+    assert any("continuous_run_minutes must be positive" in item for item in result["failures"])
+    assert any("text request_count must be positive" in item for item in result["failures"])
+    assert any("audio audio_packet_count must be positive" in item for item in result["failures"])
+    assert any("video evidence_file is not independent" in item for item in result["failures"])
 
 
 def test_rejects_report_placeholder_and_bad_artifact_hash(tmp_path: Path) -> None:

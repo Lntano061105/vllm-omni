@@ -10,6 +10,7 @@ import json
 import re
 import sys
 import tarfile
+from datetime import datetime
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
@@ -159,6 +160,14 @@ def _nonempty(path: Path, failures: list[str]) -> None:
         failures.append(f"missing or empty evidence file: {path}")
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _exists(path: Path, failures: list[str]) -> None:
     if not path.is_file():
         failures.append(f"missing evidence file: {path}")
@@ -179,7 +188,7 @@ def _verify_local_sha256_manifest(path: Path, failures: list[str]) -> None:
         if not target.is_file():
             failures.append(f"SHA256 manifest target is missing: {target}")
             continue
-        actual = hashlib.sha256(target.read_bytes()).hexdigest()
+        actual = _sha256_file(target)
         if actual != expected:
             failures.append(f"SHA256 mismatch: {target}")
 
@@ -634,21 +643,96 @@ def _check_demo(demo_root: Path, failures: list[str]) -> None:
         "unexpected_error_count",
         "audio_interruption_count",
         "empty_audio_packet_count",
+        "audio_underrun_count",
     ):
         if manifest.get(key) != 0:
             failures.append(f"Demo {key}={manifest.get(key)!r}, expected 0")
+    timestamps: dict[str, datetime] = {}
     for key in ("started_utc", "finished_utc"):
         value = manifest.get(key)
         if not isinstance(value, str) or not value or value == "REPLACE_ME":
             failures.append(f"Demo {key} is not populated")
-    if not isinstance(manifest.get("continuous_run_minutes"), (int, float)) or manifest["continuous_run_minutes"] <= 0:
+        else:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise ValueError("timezone is required")
+                timestamps[key] = parsed
+            except ValueError:
+                failures.append(
+                    f"Demo {key} is not a valid timezone-aware ISO-8601 timestamp"
+                )
+    continuous_minutes = manifest.get("continuous_run_minutes")
+    if (
+        isinstance(continuous_minutes, bool)
+        or not isinstance(continuous_minutes, (int, float))
+        or continuous_minutes <= 0
+    ):
         failures.append("Demo continuous_run_minutes must be positive")
+    elif set(timestamps) == {"started_utc", "finished_utc"}:
+        elapsed_minutes = (
+            timestamps["finished_utc"] - timestamps["started_utc"]
+        ).total_seconds() / 60
+        if elapsed_minutes <= 0:
+            failures.append("Demo finished_utc must be after started_utc")
+        elif continuous_minutes > elapsed_minutes + 0.1:
+            failures.append(
+                "Demo continuous_run_minutes exceeds timestamp elapsed duration"
+            )
     scenarios = manifest.get("scenarios")
+    scenario_evidence_paths: set[Path] = set()
     for name in ("text", "audio", "video", "text_audio"):
         if not isinstance(scenarios, dict) or not isinstance(scenarios.get(name), dict):
             failures.append(f"Demo scenario is missing: {name}")
-        elif scenarios[name].get("passed") is not True:
+            continue
+        scenario = scenarios[name]
+        if scenario.get("passed") is not True:
             failures.append(f"Demo scenario did not pass: {name}")
+        request_count = scenario.get("request_count")
+        completed = scenario.get("completed_response_count")
+        if (
+            isinstance(request_count, bool)
+            or not isinstance(request_count, int)
+            or request_count <= 0
+        ):
+            failures.append(f"Demo scenario {name} request_count must be positive")
+        elif (
+            isinstance(completed, bool)
+            or not isinstance(completed, int)
+            or completed != request_count
+        ):
+            failures.append(
+                f"Demo scenario {name} completed_response_count={completed!r}, "
+                f"expected request_count={request_count}"
+            )
+        if name != "text":
+            packets = scenario.get("audio_packet_count")
+            if (
+                isinstance(packets, bool)
+                or not isinstance(packets, int)
+                or packets <= 0
+            ):
+                failures.append(
+                    f"Demo scenario {name} audio_packet_count must be positive"
+                )
+        raw_evidence = scenario.get("evidence_file")
+        if not isinstance(raw_evidence, str) or raw_evidence.startswith("REPLACE_"):
+            failures.append(f"Demo scenario {name} evidence_file is not populated")
+        else:
+            evidence_path = (demo_root / raw_evidence).resolve()
+            try:
+                evidence_path.relative_to(demo_root.resolve())
+            except ValueError:
+                failures.append(
+                    f"Demo scenario {name} evidence_file escapes demo root"
+                )
+            else:
+                if evidence_path in scenario_evidence_paths:
+                    failures.append(
+                        f"Demo scenario {name} evidence_file is not independent"
+                    )
+                scenario_evidence_paths.add(evidence_path)
+                _nonempty(evidence_path, failures)
     for key in ("service_log", "video_file"):
         raw = manifest.get(key)
         if not isinstance(raw, str) or not raw or raw == "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT":
@@ -661,6 +745,34 @@ def _check_demo(demo_root: Path, failures: list[str]) -> None:
                 failures.append(f"Demo {key} escapes demo root: {raw}")
             else:
                 _nonempty(path, failures)
+                sha_key = (
+                    "service_log_sha256" if key == "service_log" else "video_sha256"
+                )
+                expected_sha = manifest.get(sha_key)
+                if not isinstance(expected_sha, str) or not re.fullmatch(
+                    r"[0-9a-fA-F]{64}", expected_sha
+                ):
+                    failures.append(f"Demo {sha_key} is not a valid SHA256")
+                elif path.is_file() and _sha256_file(path) != expected_sha.lower():
+                    failures.append(f"Demo {key} SHA256 mismatch")
+                if key == "video_file" and path.is_file():
+                    with path.open("rb") as handle:
+                        header = handle.read(32)
+                    if b"ftyp" not in header and not header.startswith(b"\x1aE\xdf\xa3"):
+                        failures.append(
+                            "Demo video_file is not recognizable MP4/WebM media"
+                        )
+                if key == "service_log" and path.is_file():
+                    log_text = path.read_text(encoding="utf-8", errors="replace")
+                    fatal_patterns = (
+                        r"(?m)^.*Traceback \(most recent call last\):",
+                        r"(?m)^.*\bERROR\b",
+                        r"ERR99999",
+                        r"Segmentation fault",
+                        r"Engine core initialization failed",
+                    )
+                    if any(re.search(pattern, log_text) for pattern in fatal_patterns):
+                        failures.append("Demo service_log contains fatal error markers")
 
 
 def _check_source(source_root: Path, failures: list[str]) -> None:

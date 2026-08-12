@@ -5,26 +5,44 @@
   "finished_utc": "REPLACE_ME",
   "continuous_run_minutes": 0,
   "service_log": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+  "service_log_sha256": "REPLACE_WITH_SHA256",
   "video_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+  "video_sha256": "REPLACE_WITH_SHA256",
   "service_exit_clean": false,
   "unexpected_error_count": 0,
   "audio_interruption_count": 0,
   "empty_audio_packet_count": 0,
+  "audio_underrun_count": 0,
   "scenarios": {
     "text": {
       "passed": false,
+      "evidence_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+      "request_count": 0,
+      "completed_response_count": 0,
       "notes": ""
     },
     "audio": {
       "passed": false,
+      "evidence_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+      "request_count": 0,
+      "completed_response_count": 0,
+      "audio_packet_count": 0,
       "notes": ""
     },
     "video": {
       "passed": false,
+      "evidence_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+      "request_count": 0,
+      "completed_response_count": 0,
+      "audio_packet_count": 0,
       "notes": ""
     },
     "text_audio": {
       "passed": false,
+      "evidence_file": "REPLACE_WITH_PATH_RELATIVE_TO_DEMO_ROOT",
+      "request_count": 0,
+      "completed_response_count": 0,
+      "audio_packet_count": 0,
       "notes": ""
     }
   }
