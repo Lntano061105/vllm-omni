@@ -35,10 +35,19 @@ def test_static_submission_package_audit_passes(tmp_path: Path) -> None:
     assert "competition/minicpmo_b/" in result["planned_new_source_prefixes"]
     assert "tests/competition/" in result["planned_new_source_prefixes"]
     assert result["required_ignored"] == []
-    assert (
-        "competition/minicpmo_b/DEMO_EVIDENCE_TEMPLATE.json"
-        in result["planned_source_files"]
-    )
+    demo_template = "competition/minicpmo_b/DEMO_EVIDENCE_TEMPLATE.json"
+    assert subprocess.run(
+        ["git", "ls-files", "--error-unmatch", demo_template],
+        cwd=repo,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    ).returncode == 0
+    assert subprocess.run(
+        ["git", "check-ignore", "-q", demo_template],
+        cwd=repo,
+        check=False,
+    ).returncode != 0
     assert all(
         not path.startswith("extra-info/")
         and not path.startswith("kernel_meta/")

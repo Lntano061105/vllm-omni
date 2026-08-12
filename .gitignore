@@ -254,6 +254,11 @@ outputs/
 results/
 generated/
 output_*/
+# Ascend compiler/profiler crash and kernel-build caches created at repo root.
+# These are machine-local runtime products; submission audit still rejects
+# them if they are ever force-added to Git.
+/extra-info/
+/kernel_meta/
 
 # Configuration overrides
 configs/local.yaml
