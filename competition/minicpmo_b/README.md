@@ -4,6 +4,49 @@
 
 ## 快速开始
 
+### 官方 pytest 统一测试入口（默认物理 NPU 5）
+
+下面两套封装直接调用主办方给出的 pytest 流程，不会替换为自定义压测逻辑。每个
+suite 的原始 JSON、pytest 日志、YAML SHA256、Git 状态和 NPU 前后快照会写入一个
+独立目录。脚本默认拒绝在已有进程占用的卡上运行，也**不会**主动杀掉他人服务。
+
+先做无副作用预检（确认依赖、模型、NPU 5 空闲）：
+
+```bash
+competition/minicpmo_b/scripts/run_official_pytest_accuracy.sh --check-only
+competition/minicpmo_b/scripts/run_official_pytest_performance.sh --check-only
+```
+
+运行完整精度集（Daily-Omni、Video-MME、Seed-TTS）：
+
+```bash
+RESULT_DIR=competition/minicpmo_b/results/baseline_accuracy_$(date -u +%Y%m%dT%H%M%SZ) \
+MODEL_PATH=/workspace/MiniCPM-o-4_5 \
+competition/minicpmo_b/scripts/run_official_pytest_accuracy.sh --suite all
+```
+
+运行官方性能集（simplex Seed-TTS 和 duplex Seed-TTS）：
+
+```bash
+RESULT_DIR=competition/minicpmo_b/results/baseline_performance_$(date -u +%Y%m%dT%H%M%SZ) \
+competition/minicpmo_b/scripts/run_official_pytest_performance.sh --suite all
+```
+
+如果长测在 Video-MME 或 Seed-TTS 中断，修复问题后用同一个 `RESULT_DIR` 续跑；已
+通过且输入/YAML/Git commit 未变的 suite 会被跳过：
+
+```bash
+competition/minicpmo_b/scripts/run_official_pytest_accuracy.sh \
+  --result-dir competition/minicpmo_b/results/baseline_accuracy_... --resume
+```
+
+精度入口默认使用上游基线 YAML。需要测优化候选时显式传入不可变的候选 YAML，例如
+`--deploy-config competition/minicpmo_b/config/minicpmo_4_5_910c_low_latency.yaml`；
+基线与候选必须使用不同的 `RESULT_DIR`，随后用
+`compare_accuracy_results.py` 比较。性能入口默认使用官方两份 JSON；若测试自定义
+性能 YAML，请先复制官方 JSON 并仅替换其中的 `--deploy-config`，再通过
+`--simplex-config` / `--duplex-config` 传入，保留数据、请求数、warmup 和并发不变。
+
 启动优化服务：
 
 ```bash

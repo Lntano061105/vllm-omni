@@ -31,7 +31,14 @@ from tests.helpers.runtime import OmniServerParams
 from tests.helpers.stage_config import get_deploy_config_path
 
 _MODEL = os.environ.get("VLLM_TEST_MINICPMO_4_5_MODEL", "openbmb/MiniCPM-o-4_5")
-_DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
+# Keep the upstream baseline as the default, while allowing the competition
+# wrappers to validate an immutable candidate YAML without editing this test.
+# This is intentionally opt-in: CI and the organizer's unmodified command
+# continue to use ``vllm_omni/deploy/minicpmo_4_5.yaml``.
+_DEPLOY_CONFIG = os.environ.get(
+    "VLLM_TEST_MINICPMO_4_5_DEPLOY_CONFIG",
+    get_deploy_config_path("minicpmo_4_5.yaml"),
+)
 _RESULT_DIR = Path(
     os.environ.get(
         "ACC_BENCH_RESULT_DIR",
